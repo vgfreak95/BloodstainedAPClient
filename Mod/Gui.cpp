@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iterator>
 #include <vector>
+#include <wrl/client.h>
 
 #include "APBridge.h"
 #include "Archipelago.h"
@@ -399,11 +400,6 @@ bool Gui::InitImGui(IDXGISwapChain* swapChain) {
 
     ImGui_ImplWin32_Init(m_GameWindow);
     ImGui_ImplDX11_Init(m_Device, m_DeviceContext);
-    ID3D11Texture2D* pBackBuffer = nullptr;
-    if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer))) && pBackBuffer) {
-        m_Device->CreateRenderTargetView(pBackBuffer, nullptr, &m_RenderTargetView);
-        pBackBuffer->Release();
-    }
 
     m_ImGuiInit = true;
     Logger::Log("ImGui initialized");
@@ -411,7 +407,7 @@ bool Gui::InitImGui(IDXGISwapChain* swapChain) {
 }
 
 
-void Gui::Render() {
+void Gui::Render(IDXGISwapChain* swapChain) {
     if (m_IsResizing) return;
 
     // Check for F5 key to toggle menu
@@ -488,9 +484,28 @@ void Gui::Render() {
 
     ImGui::Render();
 
-    if (m_RenderTargetView) {
-        m_DeviceContext->OMSetRenderTargets(1, &m_RenderTargetView, nullptr);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    // Never retain a back-buffer reference between Presents: Unreal may call
+    // ResizeBuffers even while the mod menu is closed.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> renderTarget;
+    if (!swapChain || FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf()))) ||
+        FAILED(m_Device->CreateRenderTargetView(backBuffer.Get(), nullptr, renderTarget.GetAddressOf()))) {
+        return;
+    }
+
+    // The ImGui backend restores its pipeline state, but not output targets.
+    // Restore ours explicitly so the context cannot keep the overlay view alive.
+    ID3D11RenderTargetView* previousTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> previousDepth;
+    m_DeviceContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, previousTargets,
+                                      previousDepth.GetAddressOf());
+    ID3D11RenderTargetView* target = renderTarget.Get();
+    m_DeviceContext->OMSetRenderTargets(1, &target, nullptr);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    m_DeviceContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, previousTargets,
+                                      previousDepth.Get());
+    for (auto* previousTarget : previousTargets) {
+        if (previousTarget) previousTarget->Release();
     }
 }
 
@@ -499,11 +514,6 @@ void Gui::Shutdown() {
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
-    }
-
-    if (m_RenderTargetView) {
-        m_RenderTargetView->Release();
-        m_RenderTargetView = nullptr;
     }
 
     if (m_DeviceContext) {
