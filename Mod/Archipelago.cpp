@@ -3,39 +3,45 @@
 
 #include <Basic.hpp>
 #include <Engine_classes.hpp>
-#include <PB_Chr_Root_classes.hpp>
 #include <ProjectBlood_classes.hpp>
 #include <ProjectBlood_structs.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <nlohmann/json.hpp>
-#include <vector>
+#include <set>
 
 #include "GameManager.h"
+#include "HookManager.h"
 #include "Logger.h"
+#include "ThreadQueue.h"
 #include "Utils.h"
 #include "apclient.hpp"
 #include "apuuid.hpp"
-#include "nlohmann/detail/value_t.hpp"
 
 std::unique_ptr<APClient> ap;
-bool ap_sync_queued = false;
-bool ap_connect_sent = false;
+bool ap_slot_connect_sent = false;
 double deathtime = -1;
-bool is_https = false;  // set to true if the context only supports wss://
-bool is_wss = false;    // set to true if the connection specifically asked for wss://
-bool is_ws = false;     // set to true if the connection specifically asked for ws://
-unsigned connect_error_count = 0;
 bool awaiting_password = false;
 
 const std::string GAME_NAME = "Bloodstained: Ritual of the Night";
 std::string game_seed;
 const int MAX_SEED_LENGTH = 32;
 
+const std::string ITEM_INDEX_SAVE_VALUE = "ItemIndex";
+const std::string CONNECTION_SAVE_PREFIX = "AP_LastConnection_";
+const std::string CLEARED_LOCATION_SAVE_PREFIX = "AP_ClearedLocation_";
+const int32_t CONNECTION_SAVE_VERSION = 1;
+const size_t MAX_CONNECTION_FIELD_LENGTH = 1024;
+const int32_t MAX_CLEARED_LOCATIONS = 4096;
+
 #define UUID_FILE "uuid"
 #define CERT_STORE "cacert.pem"
 
 using json = nlohmann::json;
+
+static std::optional<int32_t> LoadSavedValue(const std::string& saveValueName);
+static std::optional<std::string> LoadSavedString(const std::string& saveValueName);
 
 Archipelago& Archipelago::Instance() {
     static Archipelago instance;
@@ -65,13 +71,8 @@ void Archipelago::ConnectSlot() {
             }
             _connected = ap->ConnectSlot(slotName_, password_, itemsHandling_, tags);
             if (_connected) {
-                SlotDataStore_.startingInventoryLockedSlot =
-                    "slot:" + std::to_string(playerSlot_) + ":lock_starting_inventory";
-                SlotDataStore_.lastIndexSlot = "slot:" + std::to_string(playerSlot_) + ":index";
-
-                ap_sync_queued = true;
+                ap_slot_connect_sent = true;
                 Logger::Log("[AP] Connection from here was successful.");
-                UpdateState(ArchipelagoConnectionState::SlotConnected);
                 return;
             } else {
                 Logger::Log("[AP] Max retries reached. Giving up.");
@@ -83,68 +84,235 @@ void Archipelago::ConnectSlot() {
     }
 }
 
-void Archipelago::SendLocationChecks(const std::string& locationId) {
-    if (!ap || !IsConnected() || !ap->is_data_package_valid()) return;
+ItemLookupResult Archipelago::GetItemLookupResult(const std::string& itemName) const {
+    if (!ap || !IsConnected() || !ap->is_data_package_valid()) return ItemLookupResult::NotReady;
+    return ap->get_item_id(itemName) == APClient::INVALID_NAME_ID ? ItemLookupResult::UnknownItem
+                                                                 : ItemLookupResult::KnownItem;
+}
 
-    std::vector<int64_t> locations;
+struct LocationResolution {
+    bool exists = false;
+    std::set<int64_t> missing;
+};
 
-    if (!locationId.starts_with("AP_")) return;
+static LocationResolution ResolveLocation(const std::string& locationId, const std::set<int64_t>& missingLocations,
+                                          const std::set<int64_t>& checkedLocations) {
+    LocationResolution resolution;
     std::string locationWithoutPrefix = locationId.substr(3);
+    auto locationExistsInWorld = [&missingLocations, &checkedLocations](int64_t locationId) {
+        return missingLocations.contains(locationId) || checkedLocations.contains(locationId);
+    };
 
-    // Is it a single-item location (no .0 suffix)
     int64_t apLocationId = ap->get_location_id(locationWithoutPrefix);
-
-    if (apLocationId != APClient::INVALID_NAME_ID) {
-        locations.push_back(apLocationId);
-        Logger::Log("[AP] Single item: ", locationWithoutPrefix, " (ID: ", apLocationId, ")");
+    if (apLocationId != APClient::INVALID_NAME_ID && locationExistsInWorld(apLocationId)) {
+        resolution.exists = true;
+        if (missingLocations.contains(apLocationId)) resolution.missing.insert(apLocationId);
     } else {
-        // Multi-item chest - check for .0, .1, .2, .3
         for (int i = 0; i <= 3; i++) {
-            // Treasurebox.0
             std::string fullLocation = locationWithoutPrefix + "." + std::to_string(i);
-            int64_t apLocationId = ap->get_location_id(fullLocation);
-
-            if (apLocationId != APClient::INVALID_NAME_ID) {
-                locations.push_back(apLocationId);
-                Logger::Log("[AP] Multi-item chest: ", fullLocation, " (ID: ", locationId, ")");
-            } else {
-                break;
+            apLocationId = ap->get_location_id(fullLocation);
+            if (apLocationId != APClient::INVALID_NAME_ID && locationExistsInWorld(apLocationId)) {
+                resolution.exists = true;
+                if (missingLocations.contains(apLocationId)) resolution.missing.insert(apLocationId);
             }
         }
     }
+    return resolution;
+}
 
-    // Send LocationScout and LocationCheck for all collected locations
-    for (int64_t locationId : locations) {
-        ap->LocationScouts({locationId}, 0);
-        ap->LocationChecks({locationId});
-        Logger::Log("[AP] Sent scout & check for location: ", locationId);
+void Archipelago::ResetLocalLocationCache() {
+    clearedLocations_.clear();
+    clearedLocationsLoaded_ = false;
+}
+
+void Archipelago::LoadClearedLocations() {
+    if (clearedLocationsLoaded_) return;
+
+    clearedLocations_.clear();
+    clearedLocationsLoaded_ = true;
+    int32_t locationCount = LoadSavedValue(CLEARED_LOCATION_SAVE_PREFIX + "Count").value_or(0);
+    if (locationCount < 0 || locationCount > MAX_CLEARED_LOCATIONS) {
+        Logger::Log(LogLevel::Error, "[AP] Invalid saved cleared-location count: ", locationCount);
+        return;
     }
+
+    for (int32_t index = 0; index < locationCount; index++) {
+        auto location = LoadSavedString(CLEARED_LOCATION_SAVE_PREFIX + std::to_string(index));
+        if (!location || !location->starts_with("AP_")) continue;
+        if (std::find(clearedLocations_.begin(), clearedLocations_.end(), *location) == clearedLocations_.end()) {
+            clearedLocations_.push_back(*location);
+        }
+    }
+    Logger::Log("[AP] Loaded ", clearedLocations_.size(), " locally cleared locations");
+}
+
+void Archipelago::RecordClearedLocation(const std::string& locationId) {
+    LoadClearedLocations();
+    if (std::find(clearedLocations_.begin(), clearedLocations_.end(), locationId) != clearedLocations_.end()) return;
+    if (clearedLocations_.size() >= static_cast<size_t>(MAX_CLEARED_LOCATIONS)) {
+        Logger::Log(LogLevel::Error, "[AP] Cleared-location save limit reached");
+        return;
+    }
+
+    size_t index = clearedLocations_.size();
+    SaveLocalString(CLEARED_LOCATION_SAVE_PREFIX + std::to_string(index), locationId);
+    SaveLocalValue(CLEARED_LOCATION_SAVE_PREFIX + "Count", static_cast<int32_t>(index + 1));
+    clearedLocations_.push_back(locationId);
+}
+
+size_t Archipelago::SendMissingClearedLocations() {
+    if (!ap || !IsConnected() || !ap->is_data_package_valid()) return 0;
+
+    LoadClearedLocations();
+    const auto missingLocations = ap->get_missing_locations();
+    const auto checkedLocations = ap->get_checked_locations();
+    std::set<int64_t> locations;
+    for (const auto& clearedLocation : clearedLocations_) {
+        auto resolution = ResolveLocation(clearedLocation, missingLocations, checkedLocations);
+        locations.insert(resolution.missing.begin(), resolution.missing.end());
+    }
+
+    if (locations.empty()) return 0;
+    ap->LocationChecks(std::list<int64_t>(locations.begin(), locations.end()));
+    Logger::Log("[AP] Reconciled ", locations.size(), " missing location checks");
+    return locations.size();
+}
+
+LocationCheckResult Archipelago::SendLocationChecks(const std::string& locationId) {
+    if (!locationId.starts_with("AP_")) return LocationCheckResult::UnknownLocation;
+    RecordClearedLocation(locationId);
+    if (!ap || !IsConnected() || !ap->is_data_package_valid()) return LocationCheckResult::NotReady;
+
+    const auto missingLocations = ap->get_missing_locations();
+    const auto checkedLocations = ap->get_checked_locations();
+    auto requestedLocation = ResolveLocation(locationId, missingLocations, checkedLocations);
+    SendMissingClearedLocations();
+
+    if (!requestedLocation.exists) return LocationCheckResult::UnknownLocation;
+    return requestedLocation.missing.empty() ? LocationCheckResult::AlreadyChecked : LocationCheckResult::Sent;
 }
 
 void Archipelago::Sync() {
     if (IsConnected() && ap) {
-        queueLastIndexReset_ = true;
+        pendingReceivedItems_.clear();
+        LoadLocalProgress();
         ap->Sync();
+        SendMissingClearedLocations();
     }
 }
 
-void Archipelago::UpdateServerLastIndex() {
-    if (!ap) return;
-    std::string key = SlotDataStore_.lastIndexSlot;
-    json defaultValue = {{"value", -1}};
-    std::list<APClient::DataStorageOperation> replaceOpts = {
-        {.operation = "replace", .value = {{"value", lastReceivedItemIndex_}}}};
-    ap->Set(key, defaultValue, false, replaceOpts);
+void Archipelago::SaveLocalValue(const std::string& saveValueName, int32_t value) const {
+    std::wstring wideSaveValueName(saveValueName.begin(), saveValueName.end());
+    auto saveValueId = SDK::UKismetStringLibrary::Conv_StringToName(wideSaveValueName.c_str());
+    SDK::UPBGameInstance::SetSavedValue(saveValueId, value);
 }
 
-void Archipelago::LockStartingInventory() {
-    if (!ap) return;
-    if (!wantsStartingInventory_) return;
-    Logger::Log("Locking starting inventory on server");
-    std::string key = SlotDataStore_.startingInventoryLockedSlot;
-    json defaultValue = {{"value", -1}};
-    std::list<APClient::DataStorageOperation> replaceOpts = {{.operation = "replace", .value = {{"value", 1}}}};
-    ap->Set(key, defaultValue, false, replaceOpts);
+static std::optional<int32_t> LoadSavedValue(const std::string& saveValueName) {
+    std::wstring wideSaveValueName(saveValueName.begin(), saveValueName.end());
+    auto saveValueId = SDK::UKismetStringLibrary::Conv_StringToName(wideSaveValueName.c_str());
+    int32_t value = 0;
+    bool isValid = false;
+    SDK::UPBGameInstance::GetSavedValue(saveValueId, &value, &isValid);
+    return isValid ? std::optional<int32_t>(value) : std::nullopt;
+}
+
+static std::optional<std::string> LoadSavedString(const std::string& saveValueName) {
+    auto lengthValue = LoadSavedValue(saveValueName + "Length");
+    if (!lengthValue || *lengthValue < 0 || static_cast<size_t>(*lengthValue) > MAX_CONNECTION_FIELD_LENGTH) {
+        return std::nullopt;
+    }
+
+    std::string value(static_cast<size_t>(*lengthValue), '\0');
+    for (size_t offset = 0; offset < value.size(); offset += 4) {
+        auto packedValue = LoadSavedValue(saveValueName + std::to_string(offset / 4));
+        if (!packedValue) return std::nullopt;
+        uint32_t bytes = static_cast<uint32_t>(*packedValue);
+        for (size_t byteIndex = 0; byteIndex < 4 && offset + byteIndex < value.size(); byteIndex++) {
+            value[offset + byteIndex] = static_cast<char>((bytes >> (byteIndex * 8)) & 0xff);
+        }
+    }
+    return value;
+}
+
+void Archipelago::SaveLocalString(const std::string& saveValueName, const std::string& value) const {
+    SaveLocalValue(saveValueName + "Length", static_cast<int32_t>(value.size()));
+    for (size_t offset = 0; offset < value.size(); offset += 4) {
+        uint32_t packedValue = 0;
+        for (size_t byteIndex = 0; byteIndex < 4 && offset + byteIndex < value.size(); byteIndex++) {
+            packedValue |=
+                static_cast<uint32_t>(static_cast<unsigned char>(value[offset + byteIndex])) << (byteIndex * 8);
+        }
+        SaveLocalValue(saveValueName + std::to_string(offset / 4), static_cast<int32_t>(packedValue));
+    }
+}
+
+void Archipelago::SaveConnectionInfo() const {
+    SaveLocalString(CONNECTION_SAVE_PREFIX + "Uri", currentUri_);
+    SaveLocalString(CONNECTION_SAVE_PREFIX + "Slot", slotName_);
+    SaveLocalString(CONNECTION_SAVE_PREFIX + "Password", password_);
+
+    SaveLocalValue(CONNECTION_SAVE_PREFIX + "DeathLink", wantsDeathlink_ ? 1 : 0);
+    SaveLocalValue(CONNECTION_SAVE_PREFIX + "Version", CONNECTION_SAVE_VERSION);
+    Logger::Log("[AP] Saved successful connection info to the current save");
+}
+
+std::optional<ArchipelagoConnectionInfo> Archipelago::LoadSavedConnectionInfo() const {
+    auto version = LoadSavedValue(CONNECTION_SAVE_PREFIX + "Version");
+    if (!version || *version != CONNECTION_SAVE_VERSION) return std::nullopt;
+
+    auto uri = LoadSavedString(CONNECTION_SAVE_PREFIX + "Uri");
+    auto slotName = LoadSavedString(CONNECTION_SAVE_PREFIX + "Slot");
+    auto password = LoadSavedString(CONNECTION_SAVE_PREFIX + "Password");
+    auto deathLink = LoadSavedValue(CONNECTION_SAVE_PREFIX + "DeathLink");
+    if (!uri || !slotName || !password || !deathLink || slotName->empty()) return std::nullopt;
+
+    return ArchipelagoConnectionInfo{*uri, *slotName, *password, *deathLink != 0};
+}
+
+void Archipelago::LoadLocalProgress() {
+    if (!ap || localSavePrefix_.empty()) return;
+
+    auto getLocalValue = [this](const std::string& name, int32_t defaultValue) {
+        std::string saveValueName = localSavePrefix_ + name;
+        std::wstring wideSaveValueName(saveValueName.begin(), saveValueName.end());
+        auto saveValueId = SDK::UKismetStringLibrary::Conv_StringToName(wideSaveValueName.c_str());
+        int32_t value = defaultValue;
+        bool isValid = false;
+        SDK::UPBGameInstance::GetSavedValue(saveValueId, &value, &isValid);
+        return isValid ? value : defaultValue;
+    };
+
+    lastReceivedItemIndex_ = getLocalValue(ITEM_INDEX_SAVE_VALUE, -1);
+    lastQueuedItemIndex_ = lastReceivedItemIndex_;
+    localProgressLoaded_ = true;
+    Logger::Log("[AP] Loaded local item index:", lastReceivedItemIndex_);
+}
+
+void Archipelago::ProcessReceivedItems() {
+    if (!ap || !ap->is_data_package_valid() || !localProgressLoaded_) return;
+
+    for (auto itemIt = pendingReceivedItems_.begin(); itemIt != pendingReceivedItems_.end();) {
+        const auto& item = itemIt->second;
+        if (item.index <= lastQueuedItemIndex_) {
+            itemIt = pendingReceivedItems_.erase(itemIt);
+            continue;
+        }
+
+        Logger::Log("[AP] Item - player:", item.player, " location:", item.location, " item:", item.item,
+                    " index:", item.index, " local index:", lastReceivedItemIndex_);
+        std::string itemId = ap->get_item_name(item.item, ap->get_game());
+        GivePlayerItem(itemId, false);
+
+        int64_t itemIndex = item.index;
+        std::string savePrefix = localSavePrefix_;
+        std::string saveValueName = savePrefix + ITEM_INDEX_SAVE_VALUE;
+        ThreadQueue::Instance().Enqueue([this, itemIndex, savePrefix, saveValueName]() {
+            SaveLocalValue(saveValueName, static_cast<int32_t>(itemIndex));
+            if (localSavePrefix_ == savePrefix) lastReceivedItemIndex_ = itemIndex;
+        });
+        lastQueuedItemIndex_ = item.index;
+        itemIt = pendingReceivedItems_.erase(itemIt);
+    }
 }
 
 std::string Archipelago::GetStateAsString() {
@@ -234,31 +402,31 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
 
     slotName_ = slotName;
     password_ = password;
-    currentUri_ = uri;
+    std::string normalizedUri = uri;
+    if (normalizedUri.starts_with("ws://")) normalizedUri.erase(0, 5);
+    if (normalizedUri.starts_with("wss://")) normalizedUri.erase(0, 6);
+    currentUri_ = normalizedUri;
     wantsDeathlink_ = wantsDeathlink;
-    queueLastIndexReset_ = false;
+    ResetLocalLocationCache();
+    localSavePrefix_.clear();
+    localProgressLoaded_ = false;
+    lastReceivedItemIndex_ = -1;
+    lastQueuedItemIndex_ = -1;
+    pendingReceivedItems_.clear();
+    HookManager::ResetCompatibilityShardMasterData();
 
-    Logger::Log(LogLevel::Debug, "[AP]", "Connecting Player: ", slotName_, "with uri: ", uri);
+    Logger::Log(LogLevel::Debug, "[AP]", "Connecting Player: ", slotName_, "with uri: ", normalizedUri);
     UpdateState(ArchipelagoConnectionState::Connecting);
 
     ap.reset();
-    is_ws = uri.rfind("ws://", 0) == 0;
-    is_wss = uri.rfind("wss://", 0) == 0;
-
-    // remove scheme from URI for UUID generation and localhost-detection; UUID is per room this way
-    std::string uri_without_scheme = uri.empty() ? APClient::DEFAULT_URI
-                                     : is_ws     ? uri.substr(5)
-                                     : is_wss    ? uri.substr(6)
-                                                 : uri;
+    std::string uri_without_scheme = normalizedUri.empty() ? APClient::DEFAULT_URI : normalizedUri;
 
     std::string uuid = ap_get_uuid(UUID_FILE, uri_without_scheme);
 
-    ap.reset(new APClient(uuid, GAME_NAME, uri.empty() ? APClient::DEFAULT_URI : uri, CERT_STORE));
+    ap.reset(new APClient(uuid, GAME_NAME, normalizedUri.empty() ? APClient::DEFAULT_URI : normalizedUri, CERT_STORE));
     game_seed = ap->get_seed();
 
-    ap_sync_queued = false;
-    connect_error_count = 0;
-
+    ap_slot_connect_sent = false;
     ap->set_socket_connected_handler([this]() {
         AbortPassword();
         UpdateState(ArchipelagoConnectionState::Connected);
@@ -276,117 +444,41 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
 
     ap->set_print_handler([this](const std::string& msg) { Logger::Log("[AP] Raw print: ", msg); });
 
-    ap->set_location_info_handler([this](const std::list<APClient::NetworkItem>& items) {
-        for (const auto& item : items) {
-            if (item.player == ap->get_player_number()) {
-                std::string itemName = ap->get_item_name(item.item, ap->get_game());
-                Logger::Log("[AP] Item - player:", item.player, " location:", item.location, " item:", item.item,
-                            "index:", item.index);
-                Archipelago::GivePlayerItem(itemName, true);
-            } else {
-                std::string otherPlayer = ap->get_player_alias(item.player);
-                std::string itemName = ap->get_item_name(item.item, ap->get_player_game(item.player));
-                std::string otherPlayerItemNotification = "Sent: " + itemName + ", To: " + otherPlayer;
-                GameManager::Instance().SendInGameNotification(otherPlayerItemNotification, 1023);
-                Logger::Log("[AP] Item belongs to other player, skipping");
-            }
-        }
+    ap->set_print_json_handler([](const APClient::PrintJSONArgs& args) {
+        if (args.type != "ItemSend" || !args.item || !args.receiving || !ap) return;
+        int player = ap->get_player_number();
+        if (args.item->player != player && *args.receiving != player) return;
+
+        std::string notification = ap->render_json(args.data);
+        if (!notification.empty()) GameManager::Instance().SendInGameNotification(notification, 1023);
     });
 
     ap->set_items_received_handler([this](const std::list<APClient::NetworkItem>& items) {
-        if (!ap->is_data_package_valid()) {
-            if (!ap_sync_queued) ap->Sync();
-            ap_sync_queued = true;
-            return;
+        for (const auto& item : items) {
+            pendingReceivedItems_.insert_or_assign(item.index, item);
         }
-        items_ = items;
-        if (ap->Get({SlotDataStore_.lastIndexSlot})) {
-            checkingIndex_ = true;
-            Logger::Log("successfully invoked get");
-        }
+        ProcessReceivedItems();
     });
 
-    ap->set_retrieved_handler([this](const std::map<std::string, json>& data) {
-        if (checkingIndex_) {
-            auto indexData = data.at(SlotDataStore_.lastIndexSlot);
-            if (indexData == nlohmann::detail::value_t::null) {
-                Logger::Log("[ReceivedHandler] index was null, setting index on server to -1");
-                UpdateServerLastIndex();
-                ap->Get({SlotDataStore_.lastIndexSlot});
-            } else {
-                auto indexValue = indexData.at("value");
-
-                if (queueLastIndexReset_) {
-                    lastReceivedItemIndex_ = indexValue;
-                    queueLastIndexReset_ = false;
-                }
-
-                for (const auto& item : items_) {
-                    Logger::Log("[AP] Item - player:", item.player, " location:", item.location, " item:", item.item);
-
-                    std::string itemId = ap->get_item_name(item.item, ap->get_game());
-
-                    Logger::Log("Item Index:", item.index, "File Index:", indexValue, "RAM Index",
-                                lastReceivedItemIndex_);
-
-                    if (item.index <= indexValue) continue;
-                    if (item.index <= lastReceivedItemIndex_) continue;
-
-                    auto player = (SDK::APB_Chr_Root_C*)GameManager::Instance().Player();
-                    SDK::FPBItemCatalogData itemData = SDK::FPBItemCatalogData();
-
-                    std::wstring wideName(itemId.begin(), itemId.end());
-                    auto itemName = SDK::UKismetStringLibrary::Conv_StringToName(wideName.c_str());
-                    player->CharacterInventory->GetItemDataById(itemName, &itemData);
-
-                    std::string receivedItemsNotification =
-                        "Item: " + itemData.Name.ToString() + ", From: " + ap->get_player_alias(item.player);
-
-                    if (itemData.Name.ToString().empty()) {
-                        receivedItemsNotification =
-                            "Item: " + itemName.ToString() + ", From: " + ap->get_player_alias(item.player);
-                    }
-
-                    // send notification and don't display the item (implied by notification)
-                    GameManager::Instance().SendInGameNotification(receivedItemsNotification, 1023);
-                    Archipelago::GivePlayerItem(itemId, false);
-                }
-                Logger::Log("Saving last item index");
-                auto lastItem = items_.back();
-                lastReceivedItemIndex_ = lastItem.index;
-            }
-            checkingIndex_ = false;
-        }
-        Logger::Log("Ending retrieved handler");
-
-        if (checkingStartInventory_) {
-            if (data.contains(SlotDataStore_.startingInventoryLockedSlot) &&
-                !data.at(SlotDataStore_.startingInventoryLockedSlot).is_null())
-                return;
-            if (!recievedStartingInventory_ && wantsStartingInventory_) {
-                Logger::Log("Giving player start inventory");
-                auto startItems = slotData_.at("start_inventory");
-                for (auto& [item, amount] : startItems.items()) {
-                    std::string itemName = item;
-                    // TODO: Make GivePlayerItem have a number of items in future
-                    for (int _ : amount) {
-                        GivePlayerItem(itemName, true);
-                    }
-                }
-                recievedStartingInventory_ = true;
-            }
-            checkingStartInventory_ = false;
-        }
+    ap->set_data_package_changed_handler([this](const json& data) {
+        Logger::Log("[AP] Data package loaded for game: ", GAME_NAME);
+        ProcessReceivedItems();
+        SendMissingClearedLocations();
+        HookManager::ApplyCompatibilityShardMasterData();
     });
-
-    ap->set_data_package_changed_handler(
-        [this](const json& data) { Logger::Log("[AP] Data package loaded for game: ", GAME_NAME); });
 
     ap->set_slot_connected_handler([this](const json& slotData) {
         Logger::Log("SLOT CONNECTED");
         Logger::Log(slotData.dump());
 
         slotData_ = slotData;
+        localSavePrefix_ = "AP_" + ap->get_seed() + "_" + std::to_string(ap->get_team_number()) + "_" +
+                           std::to_string(ap->get_player_number()) + "_";
+        LoadLocalProgress();
+        UpdateState(ArchipelagoConnectionState::SlotConnected);
+        SendMissingClearedLocations();
+        HookManager::ApplyCompatibilityShardMasterData();
+        SaveConnectionInfo();
 
         if (slotData.contains("drop_experience_multiplier") && !slotData.at("drop_experience_multiplier").is_null()) {
             auto value = slotData.at("drop_experience_multiplier").get<float>();
@@ -412,28 +504,10 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
             shardDropInitialGrade_ = slotData.at("drop_shard_initial_grade").get<int64_t>();
         }
 
-        if (slotData.contains("start_inventory") && !slotData.at("start_inventory").is_null()) {
-            wantsStartingInventory_ = true;
-            if (ap->Get({SlotDataStore_.startingInventoryLockedSlot})) {
-                checkingStartInventory_ = true;
-                Logger::Log("Getting player starting inventory");
-            }
-        }
+        ProcessReceivedItems();
 
-        // Store missing locations
-        if (slotData.contains("missing_locations")) {
-            for (const auto& loc : slotData["missing_locations"]) {
-                missingLocations_.insert(loc.get<int64_t>());
-            }
-        }
-        // Store checked locations
-        if (slotData.contains("checked_locations")) {
-            for (const auto& loc : slotData["checked_locations"]) {
-                checkedLocations_.insert(loc.get<int64_t>());
-            }
-        }
-        Logger::Log("[AP] Loaded ", missingLocations_.size(), " missing and ", checkedLocations_.size(),
-                    " checked locations");
+        Logger::Log("[AP] Loaded ", ap->get_missing_locations().size(), " missing and ",
+                    ap->get_checked_locations().size(), " checked locations");
     });
 
     // Handlers for disconnection
@@ -446,8 +520,9 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
 
     ap->set_slot_disconnected_handler([this]() {
         Logger::Log(LogLevel::Debug, "[AP]", "Player: ", slotName_, "disconnected");
+        HookManager::ResetCompatibilityShardMasterData();
         UpdateState(ArchipelagoConnectionState::Disconnected);
-        ap_connect_sent = false;
+        ap_slot_connect_sent = false;
     });
 
     ap->set_slot_refused_handler([this](const std::list<std::string>& reasons_list) {
@@ -456,7 +531,6 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
     });
 
     ap->set_socket_error_handler([this, slotName](const std::string& error) {
-        connect_error_count++;
         Logger::Log(LogLevel::Debug, "[AP]", "Player: ", slotName, "disconnected. Error: ", error);
         UpdateState(ArchipelagoConnectionState::SocketDisconnectedError);
     });
@@ -492,13 +566,18 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
 void Archipelago::AbortPassword() { awaiting_password = false; }
 
 void Archipelago::Disconnect() {
+    HookManager::ResetCompatibilityShardMasterData();
     UpdateState(ArchipelagoConnectionState::Disconnected);
     ap.reset();
+    ap_slot_connect_sent = false;
+    pendingReceivedItems_.clear();
+    localSavePrefix_.clear();
+    localProgressLoaded_ = false;
 }
 
 void Archipelago::Poll() {
     if (ap) ap->poll();
-    if (state_ == ArchipelagoConnectionState::Connected && !ap_sync_queued) {
+    if (state_ == ArchipelagoConnectionState::Connected && !ap_slot_connect_sent) {
         ConnectSlot();
     }
 }
