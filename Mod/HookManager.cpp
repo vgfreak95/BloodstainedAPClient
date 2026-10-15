@@ -15,10 +15,13 @@
 #include "CoreUObject_classes.hpp"
 #include "GameManager.h"
 #include "Gui.h"
+#include "InGameTracker.h"
 #include "ItemGetPopup_classes.hpp"
 #include "Logger.h"
+#include "MainMenuStatus.h"
 #include "Mod/Archipelago.h"
 #include "ProjectBlood_classes.hpp"
+#include "QualityOfLife.h"
 #include "SDK.hpp"
 #include "Utils.h"
 
@@ -28,6 +31,7 @@ std::set<std::string> HookManager::processedWidgets;
 void (*HookManager::originalProcessEvent)(SDK::UObject*, SDK::UFunction*, void*) = nullptr;
 void (*HookManager::originalProcessLocalScriptFunction)(SDK::UObject*, SDK::UFunction*, void*) = nullptr;
 bool HookManager::playerDetected = false;
+bool HookManager::shuttingDown = false;
 
 struct ShardAppearance {
     SDK::EShardType type;
@@ -169,6 +173,8 @@ const std::unordered_map<std::string, const char*> knownVanillaShardIds = {
     {"AP_Shortcut_Shard", "Shortcut"},
     {"AP_Deepsinker_Shard", "Deepsinker"},
     {"AP_FamiliaSilverKnight_Shard", "FamiliaSilverKnight"},
+    {"AP_Aquastream_Shard", "Aquastream"},
+    {"AP_FamiliaIgniculus_Shard", "FamiliaIgniculus"},
     {"AP_FamiliaArcher_Shard", "FamiliaArcher"},
 };
 
@@ -288,7 +294,9 @@ void HookManager::ApplyCompatibilityShardMasterData() {
     if (!shardManager || !shardManager->ShardMasterTable) return;
     auto* dropManager = SDK::UPBDropManager::GetDropManager();
 
-    size_t patchedRows = 0;
+    const bool autoSellRepeatedShards = QualityOfLife::Instance().IsAutoSellWastedShardsEnabled();
+    size_t compatibilityRows = 0;
+    size_t unsuppressedDropRows = 0;
     for (const auto& [randomizedName, vanillaName] : knownVanillaShardIds) {
         SDK::FName vanillaShardId = FNameFromString(vanillaName);
         ItemLookupResult itemResult = GetVanillaShardItemSupport(*archipelago, vanillaShardId);
@@ -296,31 +304,37 @@ void HookManager::ApplyCompatibilityShardMasterData() {
             ResetCompatibilityShardMasterData();
             return;
         }
-        if (itemResult == ItemLookupResult::KnownItem) continue;
+        const bool needsCompatibility = itemResult == ItemLookupResult::UnknownItem;
 
-        auto* randomizedRow = FindShardMasterRow(shardManager->ShardMasterTable, randomizedName);
-        auto* vanillaRow = FindShardMasterRow(shardManager->ShardMasterTable, vanillaName);
-        if (!randomizedRow || !vanillaRow) continue;
+        if (needsCompatibility) {
+            auto* randomizedRow = FindShardMasterRow(shardManager->ShardMasterTable, randomizedName);
+            auto* vanillaRow = FindShardMasterRow(shardManager->ShardMasterTable, vanillaName);
+            if (randomizedRow && vanillaRow) {
+                originalRandomizedShardAppearances[randomizedName] =
+                    ShardAppearance{randomizedRow->ShardType, randomizedRow->ShardColorOverride};
+                randomizedRow->ShardType = vanillaRow->ShardType;
+                randomizedRow->ShardColorOverride = vanillaRow->ShardColorOverride == SDK::EShardColor::None
+                                                          ? DefaultShardColor(vanillaRow->ShardType)
+                                                          : vanillaRow->ShardColorOverride;
+                compatibilityRows++;
+            }
+        }
 
-        originalRandomizedShardAppearances[randomizedName] =
-            ShardAppearance{randomizedRow->ShardType, randomizedRow->ShardColorOverride};
-        randomizedRow->ShardType = vanillaRow->ShardType;
-        randomizedRow->ShardColorOverride = vanillaRow->ShardColorOverride == SDK::EShardColor::None
-                                                  ? DefaultShardColor(vanillaRow->ShardType)
-                                                  : vanillaRow->ShardColorOverride;
-
-        if (dropManager && dropManager->DropTable && randomizedName.starts_with("AP_")) {
+        if ((needsCompatibility || autoSellRepeatedShards) && dropManager && dropManager->DropTable &&
+            randomizedName.starts_with("AP_")) {
             std::string dropRowName = randomizedName.substr(3);
             auto* dropRow = FindDropMasterRow(dropManager->DropTable, dropRowName);
             if (dropRow) {
                 originalRandomizedDropFlags[dropRowName] = dropRow->DropSpecialFlags;
                 dropRow->DropSpecialFlags = SDK::EDropSpecialFlag::None;
+                unsuppressedDropRows++;
             }
         }
-        patchedRows++;
     }
 
-    Logger::Log("[Shard] Applied old-world compatibility to ", patchedRows, " shard rows");
+    Logger::Log(LogLevel::File, "[Shard] Applied shard table patches; compatibility rows:",
+                compatibilityRows, "unsuppressed drop rows:", unsuppressedDropRows,
+                "auto-sell repeats:", autoSellRepeatedShards);
 }
 
 bool HookManager::Init() {
@@ -363,18 +377,47 @@ bool HookManager::Init() {
 
     // When game and player completely load in
     NotifyOnClassFunction("PBGameMode_Miriam_BP_C", "OnLoadGameCompletely", [](void* obj) {
+        // The title world and its widgets have already been destroyed by this point.
+        // Drop our stale references without invoking a method on the dead widget.
+        MainMenuStatus::Instance().Forget();
         GameManager::Instance().PlayerAlive();
+        InGameTracker::Instance().LoadDisplayMode();
+        QualityOfLife::Instance().LoadSettings();
+        InGameTracker::Instance().InvalidateReachability("save loaded");
         Archipelago::Instance().ResetLocalLocationCache();
+        Archipelago::Instance().ApplySavedEnemyDropShuffle();
         Gui::Instance().TryAutoConnect();
         APBridge::Instance().EnqueueSync();
         Logger::Log("Player respawned");
     });
+
+    NotifyOnClassFunction("TitleMainMenu_C", "Tick",
+                          [](void* obj) { MainMenuStatus::Instance().Show(static_cast<SDK::UObject*>(obj)); });
 
     Logger::Log("HookManager initialized successfully");
     return true;
 }
 
 bool HookManager::PostInit() {
+    NotifyOnClassFunction("MapManageBlueprint_C", "Event_MapStart",
+                          [](void* obj) { InGameTracker::Instance().ApplyMapMarkers(obj); });
+    NotifyOnClassFunction("MapManageBlueprint_C", "Tick",
+                          [](void* obj) { InGameTracker::Instance().ApplyDeferredGhostMap(obj); });
+    NotifyOnClassFunction("MiniMapBlueprint_C", "Tick",
+                          [](void* obj) { InGameTracker::Instance().ApplyMiniMap(obj); });
+
+    NotifyOnClassFunctionWithParams(
+        "PBCharacterInventoryComponent", "GetItemWithDisplay",
+        [](void* obj, const std::string& functionName, void* rawParams) {
+            if (functionName != "GetItemWithDisplay" || !rawParams) return;
+
+            auto* params = static_cast<SDK::Params::PBCharacterInventoryComponent_GetItemWithDisplay*>(rawParams);
+            if (params->Quantity <= 0 || !params->ReturnValue) return;
+
+            const std::string nativeItemId = params->newItemId.ToString();
+            if (!nativeItemId.empty()) InGameTracker::Instance().ObserveNativeItem(nativeItemId);
+        });
+
     // Whens constantly when the player is alive
     NotifyOnClassFunction("Chr_P0000_C", "GetAdditionalCameraTargetLocations", [](void* obj) {
         if (!Archipelago::ConnectedInstance()) return;
@@ -472,6 +515,11 @@ bool HookManager::PostInit() {
         } else if (checkResult == LocationCheckResult::Sent) {
             instance().GivePlayerItem(shardName, false, 0);
             Logger::Log("[Shard] Sent location check:", shardName);
+        } else if (checkResult == LocationCheckResult::AlreadyChecked &&
+                   QualityOfLife::Instance().IsAutoSellWastedShardsEnabled()) {
+            QualityOfLife::Instance().SellRepeatedShardNow(*vanillaShardId);
+            Logger::Log(LogLevel::File, "[Shard] Sold repeated AP shard and suppressed actor:", shardName,
+                        "vanilla shard:", vanillaShardId->ToString());
         }
 
         ((SDK::AActor*)(shardBase))->K2_DestroyActor();
@@ -496,7 +544,13 @@ bool HookManager::PostInit() {
 
 void HookManager::ProcessEventBefore(SDK::UObject* obj, SDK::UFunction* func, void* params) {
     if (!obj || !func) return;
+    QualityOfLife::Instance().ProcessEventBefore(obj, func, params);
     std::string functionName = func->Name.GetRawString();
+
+    if (functionName == "QuitGame" || functionName == "QuitGameYes") {
+        shuttingDown = true;
+        Archipelago::Instance().Shutdown();
+    }
 
     // UserConstructionScript selects the shard actor's material. Restore the vanilla
     // ID before that script runs so compatibility shards use their real category color.

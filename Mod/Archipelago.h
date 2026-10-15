@@ -1,14 +1,21 @@
 #pragma once
 #include <apclient.hpp>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <list>
 #include <map>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using json = nlohmann::json;
+
+enum class ItemGrantResult;
 
 struct ArchipelagoConnectionInfo {
     std::string uri;
@@ -53,13 +60,19 @@ class Archipelago {
     // AP Actions
     bool Connect(const std::string& slotName, const std::string& password, std::string uri, const bool& wantsDeathlink);
     void Disconnect();
+    void Shutdown();
     void Poll();
     void Sync();
     void ResetLocalLocationCache();
+    void ApplySavedEnemyDropShuffle();
     std::optional<ArchipelagoConnectionInfo> LoadSavedConnectionInfo() const;
 
     LocationCheckResult SendLocationChecks(const std::string& locationId);
     ItemLookupResult GetItemLookupResult(const std::string& itemName) const;
+    bool IsMissingLocation(const std::string& locationName, std::uint64_t expectedId) const;
+    bool WasLocationClearedLocally(const std::string& locationName);
+    std::unordered_map<std::string, std::uint32_t> GetTrackerInventory() const;
+    std::unordered_set<std::uint64_t> GetMissingLocationIds() const;
 
     void ExecuteConsoleCommand(const char* command);
 
@@ -72,36 +85,60 @@ class Archipelago {
     void LoadClearedLocations();
     void LoadLocalProgress();
     void ProcessReceivedItems();
+    void CompleteReceivedItem(int64_t itemIndex, int64_t itemId, const std::string& itemName,
+                              const std::string& savePrefix, uint64_t generation, ItemGrantResult result);
+    void LoadItemLedger();
+    void PersistAwardedItemCounts() const;
+    void PersistObservedItemLedger() const;
+    void UpdateObservedItemLedger();
+    void ReconcileReceivedProgressionInventory();
+    void ReconcileCompletedBossShardLocations();
+    void TryMigrateLegacyProgress();
     void RecordClearedLocation(const std::string& locationId);
     void SaveConnectionInfo() const;
+    bool ApplyConnectedEnemyDropShuffle(const std::string& seedName, std::uint32_t slotId);
+    void SaveLocalInt64(const std::string& name, int64_t value) const;
     void SaveLocalString(const std::string& name, const std::string& value) const;
     size_t SendMissingClearedLocations();
     void SaveLocalValue(const std::string& name, int32_t value) const;
     void UpdateState(ArchipelagoConnectionState newState);
 
     // General Management Actions
-    void GivePlayerItem(std::string& itemName, bool shouldDisplay = true);
+    bool GivePlayerItem(const std::string& itemName, bool shouldDisplay,
+                        std::function<void(ItemGrantResult)> completion = {});
 
     ArchipelagoConnectionState state_;
     std::string currentUri_;
     std::string slotName_;
     std::string password_;
     std::string localSavePrefix_;
+    std::string loadedLedgerPrefix_;
     int itemsHandling_ = 0b111;  // Send all received items, including starting inventory
 
     mutable std::string lastError_;
     mutable int64_t lastReceivedItemIndex_ = -1;
     int64_t lastQueuedItemIndex_ = -1;
+    std::optional<int32_t> legacyReceivedItemIndex_;
     mutable bool pendingDeathlink_ = false;
     mutable bool wantsDeathlink_ = false;
     bool localProgressLoaded_ = false;
+    bool processingReceivedItems_ = false;
+    bool receivedItemGrantPending_ = false;
+    bool receivedProgressionInventoryReconciled_ = false;
     bool clearedLocationsLoaded_ = false;
+    bool itemLedgerLoaded_ = false;
+    std::atomic_flag polling_ = ATOMIC_FLAG_INIT;
+    std::chrono::steady_clock::time_point receivedItemRetryAt_{};
+    uint64_t receivedItemGeneration_ = 0;
 
     std::map<int64_t, APClient::NetworkItem> pendingReceivedItems_;
+    std::map<int64_t, APClient::NetworkItem> receivedItems_;
+    std::map<int64_t, int64_t> observedItemIdsByIndex_;
+    std::unordered_map<int64_t, std::uint32_t> awardedItemCounts_;
     std::vector<std::string> clearedLocations_;
     json slotData_;
 
-    int64_t shardDropInitialGrade_;
+    int64_t shardDropInitialGrade_ = 1;
 
     std::list<std::string> deathReasons_ = {"Dominiques elbow was too strong for Miriam.",
                                             "Johannes failed at at making his latest potion",

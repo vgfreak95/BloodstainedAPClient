@@ -10,11 +10,13 @@
 #include <UnrealContainers.hpp>
 #include <algorithm>
 #include <format>
+#include <utility>
 
 #include "CoreUObject_classes.hpp"
 #include "Engine_classes.hpp"
 #include "Logger.h"
 #include "ThreadQueue.h"
+#include "TrackerData.generated.h"
 #include "Utils.h"
 
 #define PLAYER_NAME "Chr_P0000_C_0"
@@ -35,11 +37,14 @@ bool GameManager::IsInstanceValid(SDK::UObject* object, const char* c_str) {
 
 bool GameManager::IsPlayerLoadedInGame() {
     auto playerController = GameManager::Instance().PlayerController();
-    if (!playerController) return false;
+    if (!playerController || !playerController->Class) return false;
     auto playerControllerName = playerController->GetName();
     if (playerControllerName != "PBPlayerController_0") return false;
     auto player = (SDK::APB_Chr_PlayerRoot_C*)playerController->Pawn;
-    if (!SDK::UKismetSystemLibrary::IsValid(player)) return false;
+    // This method is used by PostInit's worker-thread polling loop. A generated
+    // UKismetSystemLibrary::IsValid call goes through ProcessEvent, so restrict
+    // the early readiness check to raw UObject state.
+    if (!player || !player->Class) return false;
     return true;
 }
 
@@ -52,6 +57,9 @@ bool GameManager::PopulateDisplayToItemIdTable() {
     for (auto& pair : itemTable->RowMap) {
         pair.Value();
         std::string itemId = pair.Key().ToString();
+        // Protocol bindings use authoritative native catalog IDs whenever one exists. Accepting identity
+        // mappings also keeps visually identical level variants distinct (their localized names are shared).
+        DisplayNameToItemId[itemId] = itemId;
         auto itemName = FNameFromString(itemId);
         SDK::FPBItemCatalogData itemData = SDK::FPBItemCatalogData();
 
@@ -63,6 +71,24 @@ bool GameManager::PopulateDisplayToItemIdTable() {
         std::string displayName = itemData.Name.ToString();
         DisplayNameToItemId[displayName] = itemId;
     }
+
+    // Do not depend on the active localization or RowMap iteration order for protocol items. The APWorld
+    // exporter supplies the canonical display name and native catalog ID for every item in its catalog.
+    for (const auto& binding : bloodstained::tracker::generated::ITEM_BINDINGS) {
+        const std::string nativeId(binding.native_name);
+        DisplayNameToItemId[nativeId] = nativeId;
+        DisplayNameToItemId[std::string(binding.display_name)] = nativeId;
+    }
+
+    // The crossover catalog also contains COL_Zangetsuto. Both rows can resolve
+    // to the same display name, while Archipelago progression specifically uses
+    // the story weapon whose native ID is Swordsman. RowMap iteration order must
+    // not decide which one received items grant or reconciliation inspects.
+    // Canonical Archipelago names come from data/translation/Item.json and can
+    // differ from the active runtime localization. Keep required disambiguation
+    // and known non-localized names deterministic here.
+    DisplayNameToItemId["Carnot's Rebuke"] = "SteamFlatWideEnd";
+    DisplayNameToItemId["Zangetsuto"] = "Swordsman";
     return true;
 }
 
@@ -94,13 +120,18 @@ bool GameManager::PostInit() {
     Sleep(200);
     ThreadQueue::Instance().Enqueue([this] { GameManager::Instance().PopulateDisplayToItemIdTable(); });
     // GameManager::Instance().PopulateDisplayToItemIdTable();
-    Logger::Log(DisplayNameToItemId["Knife"]);
     Logger::Log("Game Manager POST initialized successfully");
     postInitCompleted = true;
     return true;
 }
 
 bool GameManager::IsInitialized() { return initCompleted && postInitCompleted ? true : false; }
+
+bool GameManager::CanReceiveItems() {
+    if (!IsPlayerLoadedInGame()) return false;
+    auto* player = Player();
+    return player && player->CharacterInventory && !DisplayNameToItemId.empty();
+}
 
 void GameManager::CheckBossSoftlock() {
     Logger::Log("Softlock fix triggered");
@@ -241,6 +272,36 @@ std::optional<SDK::FPBItemCatalogData> GameManager::CheckAllInventories(const st
     return std::nullopt;
 }
 
+bool GameManager::UnlockEquipmentInShop(const std::string& itemName) {
+    auto* player = static_cast<SDK::APB_Chr_Root_C*>(Player());
+    if (!player || !player->CharacterInventory) return false;
+
+    constexpr int flyingEdgeBuyPrice = 10000;
+    constexpr int flyingEdgeSellPrice = 1000;
+    auto unlockIn = [&](SDK::TArray<SDK::FPBItemCatalogData>& items) {
+        for (auto& item : items) {
+            if (item.ID.ToString() != itemName) continue;
+
+            // Flying Edge is ordinary, consumable crafting equipment, but the base game
+            // gives it a zero shop price because it was never intended to be renewable.
+            if (itemName == "RemoteDart" && item.buyPrice <= 0) {
+                item.buyPrice = flyingEdgeBuyPrice;
+                item.sellPrice = flyingEdgeSellPrice;
+            }
+            if (item.buyPrice <= 0) return false;
+
+            item.IsCrafted = true;
+            return true;
+        }
+        return false;
+    };
+
+    auto* inventory = player->CharacterInventory;
+    return unlockIn(inventory->myWeapons) || unlockIn(inventory->myArmors) ||
+           unlockIn(inventory->myHeadGears) || unlockIn(inventory->myAccessories) ||
+           unlockIn(inventory->myMufflers);
+}
+
 bool GameManager::ItemHasItemCategory(const std::string& itemName, SDK::ECarriedCatalog category) {
     SDK::UPBGameInstance* inst = (SDK::UPBGameInstance*)GameManager::Instance().GameInstance();
     auto itemFName = FNameFromString(itemName);
@@ -272,29 +333,46 @@ bool GameManager::ItemHasItemCategories(const std::string& itemName,
     return false;
 }
 
-void GameManager::GivePlayerItem(const std::string& name, bool shouldDisplay, int count) {
-    auto player = GameManager::Instance().Player();
-    auto inventory = player->CharacterInventory;
-    SDK::UPBGameInstance* inst = (SDK::UPBGameInstance*)GameManager::Instance().GameInstance();
-
-    auto itemName = FNameFromString(name);
-
-    SDK::FPBItemCatalogData itemData = SDK::FPBItemCatalogData();
-
-    auto itemInInventory = GameManager::Instance().CheckAllInventories(name);
-    inventory->GetItemDataById(itemName, &itemData);
-
-    if (itemInInventory.has_value()) {
-        if (itemInInventory->Num == itemInInventory->MaxNum) {
-            auto iconId = inventory->GetItemIcon(itemInInventory->ID);
-            GameManager::Instance().SendInGameNotification("Limit reached: " + itemData.Name.ToString(), iconId);
+void GameManager::GivePlayerItem(const std::string& name, bool shouldDisplay, int count,
+                                 std::function<void(ItemGrantResult)> completion) {
+    ThreadQueue::Instance().Enqueue([name, shouldDisplay, count, completion = std::move(completion)]() {
+        auto& gameManager = GameManager::Instance();
+        if (!gameManager.CanReceiveItems()) {
+            if (completion) completion(ItemGrantResult::Rejected);
+            return;
         }
-        Logger::Log("Player has", itemInInventory->Num, "of", name);
-    }
 
-    ThreadQueue::Instance().Enqueue([itemName, inventory, shouldDisplay, count]() {
-        auto instance = (SDK::UPBGameInstance*)GameManager::Instance().GameInstance();
-        inventory->GetItemWithDisplay(itemName, count, shouldDisplay);
+        auto* inventory = gameManager.Player()->CharacterInventory;
+        auto itemName = FNameFromString(name);
+        SDK::FPBItemCatalogData itemData{};
+        inventory->GetItemDataById(itemName, &itemData);
+
+        auto itemInInventory = gameManager.CheckAllInventories(name);
+        const int previousCount = itemInInventory ? itemInInventory->Num : 0;
+        if (itemInInventory.has_value()) {
+            Logger::Log("Player has", itemInInventory->Num, "of", name);
+            if (itemInInventory->Num >= itemInInventory->MaxNum) {
+                auto iconId = inventory->GetItemIcon(itemInInventory->ID);
+                gameManager.SendInGameNotification("Limit reached: " + itemData.Name.ToString(), iconId);
+                if (completion) completion(ItemGrantResult::AtCapacity);
+                return;
+            }
+        }
+
+        const bool nativeGrantAccepted = inventory->GetItemWithDisplay(itemName, count, shouldDisplay);
+        const auto itemAfterGrant = gameManager.CheckAllInventories(name);
+        const bool inventoryUpdated = itemAfterGrant && itemAfterGrant->Num > previousCount;
+        if (nativeGrantAccepted && !inventoryUpdated) {
+            Logger::Log(LogLevel::File, "[AP] Native item grant reported success without updating inventory:",
+                        name, "previous count:", previousCount,
+                        "current count:", itemAfterGrant ? itemAfterGrant->Num : 0);
+        }
+        if (nativeGrantAccepted && inventoryUpdated && gameManager.UnlockEquipmentInShop(name)) {
+            Logger::Log(LogLevel::File, "[AP] Unlocked received equipment in shop:", name);
+        }
+        if (completion) {
+            completion(nativeGrantAccepted && inventoryUpdated ? ItemGrantResult::Granted : ItemGrantResult::Rejected);
+        }
     });
 }
 

@@ -44,7 +44,7 @@
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
-    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
+    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
@@ -52,7 +52,7 @@
     <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
-    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
+    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -72,16 +72,18 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros">
-    <BSGamePath>C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
+    <BSGamePath>C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <BSGamePath>C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
-    <TargetName>version</TargetName>
+    <BSGamePath>C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
+    <TargetName>BloodstainedAP</TargetName>
+    <TargetExt>.asi</TargetExt>
     <ExternalIncludePath>CppSDK;CppSDK/SDK;subprojects;$(ExternalIncludePath)</ExternalIncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <BSGamePath>C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
-    <TargetName>version</TargetName>
+    <BSGamePath>C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
+    <TargetName>BloodstainedAP</TargetName>
+    <TargetExt>.asi</TargetExt>
     <ExternalIncludePath>CppSDK;CppSDK/SDK;subprojects;$(ExternalIncludePath)</ExternalIncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -120,7 +122,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>CppSDK/SDK;subprojects/json/include;subprojects/valijson/include;subprojects/wswrap/include;subprojects/websocketpp;subprojects/asio/asio/include;subprojects/asio/include;subprojects/apclientpp;.;CppSDK;extern;extern/libdetour;extern/imgui;extern/imgui/backends;extern/kiero;extern/minhook/include;extern/minhook/src;vcpkg_installed\x64-windows-static-md\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Zc:__cplusplus /bigobj /experimental:deterministic /pathmap:$(ProjectDir)= %(AdditionalOptions)</AdditionalOptions>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
     </ClCompile>
     <Link>
@@ -131,7 +133,8 @@
       <AdditionalDependencies>vcpkg_installed\x64-windows-static-md\lib\libcrypto.lib;vcpkg_installed\x64-windows-static-md\lib\libssl.lib;vcpkg_installed\x64-windows-static-md\lib\zlib.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /F "$(TargetPath)" "$(BSGamePath)\"</Command>
+      <Command>if not exist "$(BSGamePath)\plugins\" mkdir "$(BSGamePath)\plugins"
+copy /Y "$(TargetPath)" "$(BSGamePath)\plugins\$(TargetFileName)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -144,7 +147,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>CppSDK/SDK;subprojects/json/include;subprojects/valijson/include;subprojects/wswrap/include;subprojects/websocketpp;subprojects/asio/asio/include;subprojects/asio/include;subprojects/apclientpp;.;CppSDK;extern;extern/libdetour;extern/imgui;extern/imgui/backends;extern/kiero;extern/minhook/include;extern/minhook/src;vcpkg_installed/x64-windows-static-md/include</AdditionalIncludeDirectories>
-      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Zc:__cplusplus /bigobj /experimental:deterministic /pathmap:$(ProjectDir)= %(AdditionalOptions)</AdditionalOptions>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <Optimization>MaxSpeed</Optimization>
     </ClCompile>
@@ -156,7 +159,8 @@
       <AdditionalDependencies>vcpkg_installed\x64-windows-static-md\lib\libcrypto.lib;vcpkg_installed\x64-windows-static-md\lib\libssl.lib;vcpkg_installed\x64-windows-static-md\lib\zlib.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /F "$(TargetPath)" "$(BSGamePath)\"</Command>
+      <Command>if not exist "$(BSGamePath)\plugins\" mkdir "$(BSGamePath)\plugins"
+copy /Y "$(TargetPath)" "$(BSGamePath)\plugins\$(TargetFileName)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -164,6 +168,7 @@
     <ClCompile Include="CppSDK\SDK\CoreUObject_functions.cpp" />
     <ClCompile Include="CppSDK\SDK\Engine_functions.cpp" />
     <ClCompile Include="CppSDK\SDK\ProjectBlood_functions.cpp" />
+    <ClCompile Include="CppSDK\SDK\UMG_functions.cpp" />
     <ClCompile Include="extern\imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="extern\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="extern\imgui\imgui.cpp" />
@@ -183,13 +188,19 @@
     </ClCompile>
     <ClCompile Include="Mod\Archipelago.cpp" />
     <ClCompile Include="Mod\APBridge.cpp" />
+    <ClCompile Include="Mod\EnemyDropShuffle.cpp" />
     <ClCompile Include="Mod\GameManager.cpp" />
     <ClCompile Include="Mod\Gui.cpp" />
     <ClCompile Include="Mod\HookManager.cpp" />
+    <ClCompile Include="Mod\InGameTracker.cpp" />
     <ClCompile Include="Mod\IToggleMod.cpp" />
     <ClCompile Include="Mod\Logger.cpp" />
+    <ClCompile Include="Mod\MainMenuStatus.cpp" />
     <ClCompile Include="Mod\ModRunner.cpp" />
+    <ClCompile Include="Mod\QualityOfLife.cpp" />
     <ClCompile Include="Mod\ToggleMods.cpp" />
+    <ClCompile Include="Mod\Tracker.cpp" />
+    <ClCompile Include="Mod\TrackerRuleEvaluator.cpp" />
     <ClCompile Include="Mod\Utils.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -223,14 +234,33 @@
     <ClInclude Include="Mod\HookManager.h" />
     <ClInclude Include="Mod\IToggleMod.h" />
     <ClInclude Include="Mod\Logger.h" />
+    <ClInclude Include="Mod\ClientVersion.h" />
+    <ClInclude Include="Mod\EnemyDropData.generated.h" />
+    <ClInclude Include="Mod\EnemyDropShuffle.h" />
+    <ClInclude Include="Mod\EnemyDropShuffleLogic.h" />
+    <ClInclude Include="Mod\MainMenuStatus.h" />
+    <ClInclude Include="Mod\Resource.h" />
     <ClInclude Include="Mod\ModRunner.h" />
     <ClInclude Include="Mod\NotifyObject.h" />
+    <ClInclude Include="Mod\QualityOfLife.h" />
+    <ClInclude Include="Mod\QualityOfLifeLogic.h" />
     <ClInclude Include="Mod\ToggleMods.h" />
+    <ClInclude Include="Mod\Tracker.h" />
+    <ClInclude Include="Mod\InGameTracker.h" />
+    <ClInclude Include="Mod\TrackerData.generated.h" />
+    <ClInclude Include="Mod\TrackerRuleEvaluator.h" />
+    <ClInclude Include="Mod\TrackerRules.generated.h" />
     <ClInclude Include="Mod\Utils.h" />
     <ClInclude Include="version\version.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="version\version.def" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Assets\chest-marker.png" />
+    <Image Include="Assets\shard-marker.png" />
+    <Image Include="Assets\wall-marker.png" />
+    <ResourceCompile Include="BloodstainedAP.rc" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="Notes.txt" />
