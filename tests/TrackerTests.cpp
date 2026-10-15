@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -7,7 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "ConnectionUri.h"
 #include "EnemyDropShuffleLogic.h"
+#include "ProgressiveItems.h"
 #include "QualityOfLifeLogic.h"
 #include "Tracker.h"
 #include "TrackerRuleEvaluator.h"
@@ -27,6 +30,23 @@ void Check(bool condition, std::string_view message) {
     if (condition) return;
     std::cerr << "FAIL: " << message << '\n';
     ++failures;
+}
+
+void TestConnectionUris() {
+    using bloodstained::connection::PrepareServerUri;
+
+    Check(PrepareServerUri("", "localhost:38281") == "ws://localhost:38281",
+          "the default local server uses ws first");
+    Check(PrepareServerUri("localhost:38281", "unused") == "ws://localhost:38281",
+          "bare localhost uses ws first");
+    Check(PrepareServerUri("wss://127.0.0.1:38281", "unused") == "ws://127.0.0.1:38281",
+          "IPv4 loopback does not use TLS");
+    Check(PrepareServerUri("[::1]:38281", "unused") == "ws://[::1]:38281",
+          "IPv6 loopback uses ws first");
+    Check(PrepareServerUri("archipelago.gg:38281", "unused") == "archipelago.gg:38281",
+          "bare remote hosts remain scheme-free for library fallback");
+    Check(PrepareServerUri("wss://archipelago.gg:443", "unused") == "wss://archipelago.gg:443",
+          "an explicit remote scheme is preserved");
 }
 
 void TestRuleEvaluator() {
@@ -155,15 +175,15 @@ void TestRealSnapshot() {
     std::cout << "Reachable locations for supplied inventory: normal=" << normal.size() << ", hard=" << hard.size()
               << ", nightmare=" << nightmare.size() << '\n';
 
-    std::size_t reachable_checked = 0;
+    std::unordered_set<std::string_view> unavailable_checked;
     for (std::string_view checked : CHECKED_SNAPSHOT) {
-        if (hard.contains(checked)) {
-            ++reachable_checked;
-            continue;
-        }
+        if (!hard.contains(checked)) unavailable_checked.insert(checked);
+    }
+    for (std::string_view checked : unavailable_checked) {
         std::cout << "Checked by the older snapshot but outside current Hard logic: " << checked << '\n';
     }
-    Check(reachable_checked == 89, "True Randomizer door logic reaches 89 of the 90 checked snapshot locations");
+    Check(unavailable_checked.empty(),
+          "current logic reaches every location checked by the True Randomizer snapshot");
 
     std::unordered_map<std::string, std::uint32_t> complete_inventory;
     for (std::string_view item : bloodstained::tracker::generated::ITEMS) complete_inventory.emplace(item, 1);
@@ -198,6 +218,24 @@ void TestGeneratedMapData() {
               oleanders_level_two->display_name == "Oleanders Lv2",
           "levelled equipment protocol IDs bind to distinct native catalog rows");
 
+    const auto crown_of_creation = std::lower_bound(
+        bloodstained::tracker::generated::ITEM_BINDINGS.begin(),
+        bloodstained::tracker::generated::ITEM_BINDINGS.end(), 725937ull,
+        [](const auto& binding, std::uint64_t id) { return binding.id < id; });
+    Check(crown_of_creation != bloodstained::tracker::generated::ITEM_BINDINGS.end() &&
+              crown_of_creation->id == 725937ull && crown_of_creation->native_name == "MonarchCrown" &&
+              crown_of_creation->display_name == "Crown of Creation",
+          "Crown of Creation protocol ID binds to its native headgear catalog row");
+
+    const auto discount_card = std::lower_bound(
+        bloodstained::tracker::generated::ITEM_BINDINGS.begin(),
+        bloodstained::tracker::generated::ITEM_BINDINGS.end(), 725520ull,
+        [](const auto& binding, std::uint64_t id) { return binding.id < id; });
+    Check(discount_card != bloodstained::tracker::generated::ITEM_BINDINGS.end() &&
+              discount_card->id == 725520ull && discount_card->native_name == "DiscountCard" &&
+              discount_card->display_name == "Discount Card",
+          "Discount Card protocol ID binds to its native key-item catalog row");
+
     std::unordered_set<std::uint64_t> item_ids;
     std::unordered_set<std::string_view> item_native_names;
     std::unordered_set<std::string_view> item_display_names;
@@ -208,6 +246,52 @@ void TestGeneratedMapData() {
         Check(item_native_names.insert(binding.native_name).second, "AP native item identifiers are unique");
         Check(item_display_names.insert(binding.display_name).second, "AP item display names are unique");
     }
+
+    const auto* progressive_orchid = bloodstained::items::FindProgressiveItem(725945ull);
+    Check(progressive_orchid != nullptr && progressive_orchid->display_name == "Progressive Encrypted Orchid" &&
+              progressive_orchid->level_offset == 21u && progressive_orchid->level_count == 3u,
+          "Encrypted Orchid has a generated progressive protocol binding");
+    Check(bloodstained::items::ResolveProgressiveItem(725945ull, 0) == "LightSaber",
+          "first progressive receipt resolves to level one");
+    Check(bloodstained::items::ResolveProgressiveItem(725945ull, 1) == "LightSaber2",
+          "second progressive receipt resolves to level two independent of inventory");
+    Check(bloodstained::items::ResolveProgressiveItem(725945ull, 2) == "LightSaber3",
+          "third progressive receipt resolves to level three");
+    Check(bloodstained::items::ResolveProgressiveItem(725945ull, 3) == "LightSaber3" &&
+              bloodstained::items::ResolveProgressiveItem(725945ull, 99) == "LightSaber3",
+          "excess progressive receipts keep resolving to the highest-value level");
+    Check(!bloodstained::items::ResolveProgressiveItem(725714ull, 0),
+          "a direct level-one grant is distinct from its progressive family");
+    for (const auto& binding : bloodstained::tracker::generated::PROGRESSIVE_ITEM_BINDINGS) {
+        Check(!binding.display_name.empty(), "every progressive AP item has a display name");
+        Check(binding.level_count >= 2u, "every progressive AP item has multiple native levels");
+        Check(item_ids.insert(binding.id).second, "progressive and standard AP protocol IDs are unique");
+        Check(item_display_names.insert(binding.display_name).second,
+              "progressive and standard AP display names are unique");
+    }
+    Check(bloodstained::tracker::generated::PROGRESSIVE_ITEM_BINDINGS.size() == 29u,
+          "all levelled equipment families have progressive bindings");
+
+    const auto& paid_dlc = bloodstained::tracker::generated::PAID_DLC_ITEM_BINDINGS;
+    Check(paid_dlc.size() == 32, "all four paid DLC packs have generated entitlement bindings");
+    std::unordered_set<std::string_view> paid_dlc_native_names;
+    for (const auto& binding : paid_dlc) {
+        Check(paid_dlc_native_names.insert(binding.native_name).second,
+              "paid DLC entitlement native identifiers are unique");
+        Check(binding.dlc_key == "DLC_0002" || binding.dlc_key == "DLC_0009" ||
+                  binding.dlc_key == "DLC_0010" || binding.dlc_key == "DLC_0011",
+              "paid DLC entitlement bindings use one of the supported pack keys");
+    }
+    Check(!paid_dlc.empty() && paid_dlc.front().id == 725704ull &&
+              paid_dlc.front().native_name == "SwordWhip" && paid_dlc.front().dlc_key == "DLC_0002",
+          "Sword Whip retains its published ID and IGA entitlement binding");
+    Check(paid_dlc.size() == 32 && paid_dlc[1].id == 725906ull &&
+              paid_dlc[1].native_name == "NeverSatisfied" && paid_dlc[1].is_shard,
+          "Insatiable retains its published ID and static shard metadata");
+    Check(paid_dlc.size() == 32 && paid_dlc.back().id == 725936ull &&
+              paid_dlc.back().native_name == "SakuraRain" && paid_dlc.back().dlc_key == "DLC_0011" &&
+              paid_dlc.back().is_shard,
+          "new cosmetic-pack IDs end deterministically with Sakura Storm");
 
     const auto ribbon = std::lower_bound(
         bloodstained::tracker::generated::ITEM_BINDINGS.begin(),
@@ -267,6 +351,37 @@ void TestGeneratedMapData() {
               "canonical chest location resolves back to its native protocol name");
     }
 
+    const auto* hidden_room_left = FindLocationByNativeName("Treasurebox_SIP025_1.0");
+    const auto* hidden_room_right = FindLocationByNativeName("Treasurebox_SIP025_2.0");
+    Check(hidden_room_left && hidden_room_left->has_map_position,
+          "Galleon hidden-room left chest has an authoritative map position");
+    Check(hidden_room_right && hidden_room_right->has_map_position,
+          "Galleon hidden-room right chest has an authoritative map position");
+    if (hidden_room_left && hidden_room_right) {
+        Check(hidden_room_left->map_x > 0.42f && hidden_room_left->map_x < 0.44f,
+              "Galleon hidden-room left chest uses its cooked actor position");
+        Check(hidden_room_right->map_x > 0.79f && hidden_room_right->map_x < 0.80f,
+              "Galleon hidden-room right chest uses its cooked actor position");
+        Check(hidden_room_left->map_x < hidden_room_right->map_x,
+              "Galleon hidden-room chest markers preserve left-to-right order");
+    }
+
+    constexpr std::array synthetic_capacity_pickups = {
+        std::pair{"Treasurebox_ENT014_2.0", std::pair{1.380952f, 0.083333f}},
+        std::pair{"Treasurebox_ENT014_3.0", std::pair{0.626984f, 1.083333f}},
+        std::pair{"Treasurebox_GDN002_1.0", std::pair{0.142857f, 0.833333f}},
+    };
+    for (const auto& [native_name, expected_position] : synthetic_capacity_pickups) {
+        const auto* location = FindLocationByNativeName(native_name);
+        Check(location && location->has_map_position,
+              "capacity pickup omitted from native marker arrays has a synthetic map position");
+        if (!location) continue;
+        Check(std::abs(location->map_x - expected_position.first) < 0.00001f,
+              "synthetic capacity pickup uses its cooked horizontal actor position");
+        Check(std::abs(location->map_z - expected_position.second) < 0.00001f,
+              "synthetic capacity pickup uses its cooked vertical actor position");
+    }
+
     const auto* shard = FindLocationByNativeName("N3007_Shard");
     Check(shard != nullptr, "shard fixture exists");
     if (shard != nullptr) {
@@ -274,6 +389,9 @@ void TestGeneratedMapData() {
         Check(native_name && *native_name == "N3007_Shard",
               "canonical shard location resolves back to its native protocol name");
     }
+    const auto* iga_shard = FindLocationByNativeName("N2013_Shard");
+    Check(iga_shard != nullptr && iga_shard->id == 725688ull,
+          "IGA's reserved shard location binding is restored at ID 725688");
     Check(!Tracker::FindNativeLocationName(0), "unknown location ID has no native protocol name");
 
     const bool all_locations_have_native_names =
@@ -282,6 +400,18 @@ void TestGeneratedMapData() {
         });
     Check(all_locations_have_native_names,
           "every player-facing tracker location resolves to a native protocol name");
+
+    constexpr std::int32_t TRAVERSE_WIDTH = 200;
+    constexpr std::int32_t TRAVERSE_HEIGHT = 100;
+    constexpr std::int32_t ROOM_MAP_TO_TRAVERSE_Z = 50;
+    for (const auto& room : bloodstained::tracker::generated::ROOMS) {
+        if (room.out_of_map) continue;
+        Check(room.x >= 0 && room.x + room.width <= TRAVERSE_WIDTH,
+              "visible room geometry fits the traversal ledger horizontally");
+        Check(room.z + ROOM_MAP_TO_TRAVERSE_Z >= 0 &&
+                  room.z + ROOM_MAP_TO_TRAVERSE_Z + room.height <= TRAVERSE_HEIGHT,
+              "visible room geometry fits the traversal ledger vertically");
+    }
 }
 
 void TestGalleonOpeningHeightGate() {
@@ -299,6 +429,111 @@ void TestGalleonOpeningHeightGate() {
           "Double Jump opens the upper room above the Galleon spawn");
     Check(with_double_jump.contains("Treasurebox_SIP024_2"),
           "Double Jump opens both chests above the Galleon spawn");
+}
+
+void TestShardRoomCoverage() {
+    Tracker tracker;
+    std::unordered_map<std::string, std::uint32_t> complete_inventory;
+    for (const std::string_view item : bloodstained::tracker::generated::ITEMS) {
+        complete_inventory.emplace(item, 99u);
+    }
+    tracker.SetInventory(complete_inventory);
+
+    const auto* shard = FindLocationByNativeName("N3109_Shard");
+    Check(shard != nullptr, "Livre shard-room fixture exists");
+    if (!shard) return;
+    const auto rooms = tracker.GetReachableEnemyRooms(*shard, Difficulty::NORMAL);
+    for (const std::string_view expected : {
+             "m07LIB_012", "m07LIB_015", "m07LIB_020", "m07LIB_034"}) {
+        Check(std::ranges::find(rooms, expected) != rooms.end(),
+              "all base Livre rooms containing the shard enemy are exported");
+    }
+}
+
+void TestScriptedAreaGates() {
+    Tracker tracker;
+    tracker.SetInventory({{"Zangetsuto", 1}});
+    const auto zangetsuto_only = tracker.GetReachableRooms(Difficulty::NORMAL);
+    Check(!std::ranges::any_of(zangetsuto_only, [](const auto* room) { return room->name.starts_with("m10BIG_"); }),
+          "Zangetsuto alone does not open the Den portal");
+    Check(!std::ranges::any_of(zangetsuto_only, [](const auto* room) { return room->name.starts_with("m20JRN_"); }),
+          "Zangetsuto alone does not light The Tunnels through the Den");
+
+    tracker.SetInventory({{"Den Portal Open", 1}});
+    const auto injected_event = tracker.GetReachableRooms(Difficulty::NORMAL);
+    Check(!std::ranges::any_of(injected_event, [](const auto* room) { return room->name.starts_with("m10BIG_"); }),
+          "derived tracker events cannot be injected as player inventory");
+}
+
+void TestIgaShardGate() {
+    Tracker tracker;
+    std::unordered_map<std::string, std::uint32_t> inventory_without_zangetsuto;
+    for (const std::string_view item : bloodstained::tracker::generated::ITEMS) {
+        if (item != "Zangetsuto") inventory_without_zangetsuto.emplace(item, 99u);
+    }
+    tracker.SetInventory(inventory_without_zangetsuto);
+    Check(!ReachableLocationNames(tracker, Difficulty::NORMAL).contains("N2013_Shard"),
+          "IGA's Insatiable shard marker requires Zangetsuto");
+
+    inventory_without_zangetsuto.emplace("Zangetsuto", 1u);
+    tracker.SetInventory(inventory_without_zangetsuto);
+    Check(ReachableLocationNames(tracker, Difficulty::NORMAL).contains("N2013_Shard"),
+          "IGA's Insatiable shard marker becomes reachable with Zangetsuto");
+}
+
+void TestBackerRoomDoorKeys() {
+    Tracker tracker;
+    std::unordered_map<std::string, std::uint32_t> complete_inventory;
+    for (const std::string_view item : bloodstained::tracker::generated::ITEMS) {
+        complete_inventory.emplace(item, 99u);
+    }
+
+    for (const auto& [key, room] : {
+             std::pair<std::string_view, std::string_view>{"Warhorse's Key", "m88BKR_001"},
+             {"Millionaire's Key", "m88BKR_002"},
+             {"Carpenter's Key", "m88BKR_004"},
+         }) {
+        auto inventory_without_key = complete_inventory;
+        inventory_without_key.erase(std::string(key));
+        tracker.SetInventory(inventory_without_key);
+        const auto without_key = tracker.GetReachableRooms(Difficulty::NORMAL);
+        Check(!std::ranges::any_of(without_key, [room](const auto* reachable) { return reachable->name == room; }),
+              "a locked backer room is unreachable without its door key");
+
+        tracker.SetInventory(complete_inventory);
+        const auto with_key = tracker.GetReachableRooms(Difficulty::NORMAL);
+        Check(std::ranges::any_of(with_key, [room](const auto* reachable) { return reachable->name == room; }),
+              "a locked backer room is reachable with its door key");
+    }
+}
+
+void TestHarrierRaceRequirements() {
+    Tracker tracker;
+    std::unordered_map<std::string, std::uint32_t> complete_inventory;
+    for (const std::string_view item : bloodstained::tracker::generated::ITEMS) {
+        complete_inventory.emplace(item, 99u);
+    }
+
+    constexpr std::array<std::string_view, 6> race_items = {
+        "High Jump", "Invert", "Dimension Shift", "Reflector Ray", "Aegis Plate", "Accelerator",
+    };
+    const auto can_reach_harrier = [&](std::string_view vertical, std::string_view protection_or_speed) {
+        auto inventory = complete_inventory;
+        for (const std::string_view item : race_items) inventory.erase(std::string(item));
+        if (!vertical.empty()) inventory.emplace(vertical, 1u);
+        if (!protection_or_speed.empty()) inventory.emplace(protection_or_speed, 1u);
+        tracker.SetInventory(inventory);
+        return ReachableLocationNames(tracker, Difficulty::NORMAL).contains("N3021_Shard");
+    };
+
+    Check(can_reach_harrier("High Jump", "Aegis Plate"), "Harrier accepts Flight plus Aegis Plate");
+    Check(can_reach_harrier("Invert", "Accelerator"), "Harrier accepts Flight plus Accelerator");
+    Check(can_reach_harrier("Dimension Shift", "Aegis Plate"), "Harrier accepts Dimension Shift plus Aegis Plate");
+    Check(can_reach_harrier("Reflector Ray", "Accelerator"), "Harrier accepts Reflector Ray plus Accelerator");
+    Check(!can_reach_harrier("High Jump", {}), "Harrier rejects vertical movement without protection or speed");
+    Check(!can_reach_harrier({}, "Aegis Plate"), "Harrier rejects Aegis Plate without vertical movement");
+    Check(!can_reach_harrier({}, "Accelerator"), "Harrier rejects Accelerator without vertical movement");
+    Check(!can_reach_harrier("Reflector Ray", {}), "Harrier rejects Reflector Ray without protection or speed");
 }
 
 std::uint64_t HashDropShuffle(const bloodstained::enemy_drop_shuffle::ShuffleResult& result) {
@@ -351,11 +586,17 @@ void TestEnemyDropShuffle() {
 }  // namespace
 
 int main() {
+    TestConnectionUris();
     TestRuleEvaluator();
     TestExcessShardQuantity();
     TestRealSnapshot();
     TestGeneratedMapData();
     TestGalleonOpeningHeightGate();
+    TestShardRoomCoverage();
+    TestScriptedAreaGates();
+    TestIgaShardGate();
+    TestBackerRoomDoorKeys();
+    TestHarrierRaceRequirements();
     TestEnemyDropShuffle();
     if (failures != 0) {
         std::cerr << failures << " tracker test(s) failed\n";

@@ -108,10 +108,10 @@ bool InstallGameWindowHooks() {
     return true;
 }
 
-void renderGui() {
+void renderGui(IDXGISwapChain* swapChain) {
     if (!Gui::Instance().IsImGuiInit()) return;
 
-    Gui::Instance().Render();
+    Gui::Instance().Render(swapChain);
 }
 
 long __stdcall HookedPresent(IDXGISwapChain* swapChain, unsigned int syncInterval, unsigned int flags) {
@@ -124,7 +124,7 @@ long __stdcall HookedPresent(IDXGISwapChain* swapChain, unsigned int syncInterva
         }
     }
 
-    renderGui();
+    renderGui(swapChain);
 
     return Gui::originalPresent(swapChain, syncInterval, flags);
 }

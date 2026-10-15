@@ -9,10 +9,13 @@
 #include <Step_P0000_classes.hpp>
 #include <UMG_classes.hpp>
 #include <UnrealContainers.hpp>
+#include <PBBronzeTreasureBox_BP_classes.hpp>
+#include <array>
 #include <optional>
 
 #include "Basic.hpp"
 #include "CoreUObject_classes.hpp"
+#include "EnemyDropShuffle.h"
 #include "GameManager.h"
 #include "Gui.h"
 #include "InGameTracker.h"
@@ -30,23 +33,92 @@ std::set<std::string> HookManager::processedWidgets;
 
 void (*HookManager::originalProcessEvent)(SDK::UObject*, SDK::UFunction*, void*) = nullptr;
 void (*HookManager::originalProcessLocalScriptFunction)(SDK::UObject*, SDK::UFunction*, void*) = nullptr;
+HookManager::UseConsumableNative HookManager::originalUseConsumable = nullptr;
+HookManager::RoomTransitionNative HookManager::originalRoomTransition = nullptr;
+bool HookManager::pendingPreTownWaystone = false;
 bool HookManager::playerDetected = false;
 bool HookManager::shuttingDown = false;
 
-struct ShardAppearance {
-    SDK::EShardType type;
-    SDK::EShardColor color;
-};
-
-static std::unordered_map<std::string, ShardAppearance> originalRandomizedShardAppearances;
 static std::unordered_map<std::string, SDK::EDropSpecialFlag> originalRandomizedDropFlags;
 
 namespace {
 
+constexpr std::string_view TOWN_WAYSTONE_ROOM = "m02VIL_003";
+constexpr std::string_view GAME_START_ROOM = "m01SIP_000";
+constexpr std::string_view WAYSTONE_ITEM_ID = "Waystone";
+// Shared native implementations. The reflected entry points are only wrappers, while native
+// callers such as the WayStone special effect call these routines directly.
+constexpr SDK::int32 USE_CONSUMABLE_NATIVE = 0x06FF1980;
+constexpr SDK::int32 ROOM_TRANSITION_NATIVE = 0x0707E270;
+constexpr std::string_view FAMILIA_ARCHER_LOCATION_ID = "AP_FamiliaArcher_Shard";
+bool pendingBreederFamiliarArcherReward = false;
+
+// The native story-load DLC pass calls these helpers directly: grant one item if absent,
+// or grant a family's base item if none of its levels is present. ProcessEvent cannot
+// intercept those calls. AP delivery uses GetItem/GetItemWrap and does not use either helper.
+using DlcMissingItemGrant = void (*)(SDK::UPBCharacterInventoryComponent*, SDK::FName);
+using DlcMissingFamilyGrant = void (*)(SDK::UPBCharacterInventoryComponent*, SDK::FName,
+                                     const SDK::TArray<SDK::FName>*);
+DlcMissingItemGrant originalDlcMissingItemGrant = nullptr;
+DlcMissingFamilyGrant originalDlcMissingFamilyGrant = nullptr;
+
+bool SuppressRandomizedDlcStarterItem(SDK::FName itemId) {
+    if (!GameManager::Instance().IsRandomizedDlcItem(itemId)) return false;
+    static std::set<std::string> loggedItems;
+    const auto name = itemId.ToString();
+    if (loggedItems.insert(name).second) {
+        Logger::Log(LogLevel::File, "[AP] Suppressed vanilla randomized-DLC missing-item grant:", name);
+    }
+    return true;
+}
+
+void HookDlcMissingItemGrant(SDK::UPBCharacterInventoryComponent* inventory, SDK::FName itemId) {
+    if (!SuppressRandomizedDlcStarterItem(itemId)) originalDlcMissingItemGrant(inventory, itemId);
+}
+
+void HookDlcMissingFamilyGrant(SDK::UPBCharacterInventoryComponent* inventory, SDK::FName itemId,
+                             const SDK::TArray<SDK::FName>* family) {
+    if (!SuppressRandomizedDlcStarterItem(itemId)) originalDlcMissingFamilyGrant(inventory, itemId, family);
+}
+
+bool InstallRandomizedDlcGrantHooks() {
+    auto* single = reinterpret_cast<unsigned char*>(SDK::InSDKUtils::GetImageBase() + 0x06FBC7E0);
+    auto* family = reinterpret_cast<unsigned char*>(SDK::InSDKUtils::GetImageBase() + 0x06FBC820);
+    // Validate both entry points before installing either hook. These are native, unreflected
+    // functions in the supported game executable, so a changed layout must not be hooked blindly.
+    constexpr std::array<unsigned char, 16> singlePrefix = {
+        0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83,
+        0xec, 0x20, 0x41, 0xb0, 0x1b, 0x48, 0x8b, 0xda};
+    constexpr std::array<unsigned char, 16> familyPrefix = {
+        0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c,
+        0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57};
+    if (!std::equal(singlePrefix.begin(), singlePrefix.end(), single) ||
+        !std::equal(familyPrefix.begin(), familyPrefix.end(), family)) {
+        Logger::Log(LogLevel::File, "[AP] Randomized-DLC grant hook signatures do not match this executable");
+        return false;
+    }
+    if (MH_CreateHook(single, &HookDlcMissingItemGrant,
+                      reinterpret_cast<void**>(&originalDlcMissingItemGrant)) != MH_OK) return false;
+    if (MH_CreateHook(family, &HookDlcMissingFamilyGrant,
+                      reinterpret_cast<void**>(&originalDlcMissingFamilyGrant)) != MH_OK) {
+        MH_RemoveHook(single);
+        return false;
+    }
+    if (MH_EnableHook(single) != MH_OK || MH_EnableHook(family) != MH_OK) {
+        MH_DisableHook(single);
+        MH_DisableHook(family);
+        MH_RemoveHook(single);
+        MH_RemoveHook(family);
+        return false;
+    }
+    Logger::Log(LogLevel::File, "[AP] Installed free and paid randomized-DLC missing-item grant suppression for story loads");
+    return true;
+}
+
 const std::unordered_map<std::string, const char*> knownVanillaShardIds = {
     // Generated from the unmodified base-game PB_DT_DropRateMaster in pakchunk0.
-    // Runtime table access is insufficient because Randomizer.pak has already replaced
-    // these rows with AP_* placeholder shards by the time this plugin loads.
+    // Runtime table access is insufficient because BloodstainedAP.pak has already
+    // replaced these rows with AP_* placeholder shards by the time this plugin loads.
     {"AP_AAAA_Shard", "Dummy"},
     {"AP_N1001_Shard", "SwingTentacle"},
     {"AP_N1002_Shard", "Bloodsteel"},
@@ -59,6 +131,7 @@ const std::unordered_map<std::string, const char*> knownVanillaShardIds = {
     {"AP_N2007_Shard", "Shadowtracer"},
     {"AP_N2012_Shard", "AccelWorld"},
     {"AP_N2013_Shard", "NeverSatisfied"},
+    {"AP_N2017_Shard", "TissRosain"},
     {"AP_N1004_Shard", "GoldBarrett"},
     {"AP_N1005_Shard", "InfernoBrace"},
     {"AP_N3006_Shard", "Ceruleansplash"},
@@ -166,6 +239,8 @@ const std::unordered_map<std::string, const char*> knownVanillaShardIds = {
     {"AP_N3088_Shard", "SummonTracer"},
     {"AP_N3018_Shard", "GunMastery"},
     {"AP_N3120_Shard", "AxStrike"},
+    {"AP_N3126_Shard", "Headfail"},
+    {"AP_N3127_Shard", "Headfail"},
     {"AP_N3057_Shard", "FoldShiu"},
     {"AP_N3106_Shard", "Chiselbalage"},
     {"AP_N3107_Shard", "RuinBeak"},
@@ -178,22 +253,36 @@ const std::unordered_map<std::string, const char*> knownVanillaShardIds = {
     {"AP_FamiliaArcher_Shard", "FamiliaArcher"},
 };
 
+// These PAK placeholders represent repeatable vanilla shard sources rather than AP checks. They must stay
+// suppressed when absent from the connected world's location set; restoring their vanilla IDs would hand out
+// progression outside Archipelago. Keep location membership authoritative so older worlds which did expose one
+// of these checks remain compatible.
+const std::unordered_set<std::string> suppressedNonLocationShardIds = {
+    "AP_FamiliaSilverKnight_Shard",
+};
+
+// Journey's Giant Dullahammer Head and Dullahammer EX reuse early-game drop rows in the cooked data. Archipelago
+// exposes them as independent locations, so split the shared source ID using the dying enemy's class before the
+// shard actor is created.
+struct SharedShardLocation {
+    const char* characterClass;
+    const char* sharedDropShardId;
+    const char* locationShardId;
+};
+
+constexpr std::array sharedShardLocations = {
+    SharedShardLocation{"Chr_N3126_C", "AP_N3090_Shard", "AP_N3126_Shard"},
+    SharedShardLocation{"Chr_N3127_C", "AP_N3015_Shard", "AP_N3127_Shard"},
+};
+
+bool IsSuppressedNonLocationShard(const std::string& shardId) {
+    return suppressedNonLocationShardIds.contains(shardId);
+}
+
 std::optional<SDK::FName> ResolveVanillaShardId(const SDK::FName& randomizedShardId) {
     auto knownShard = knownVanillaShardIds.find(randomizedShardId.ToString());
     if (knownShard == knownVanillaShardIds.end()) return std::nullopt;
     return FNameFromString(knownShard->second);
-}
-
-ItemLookupResult GetVanillaShardItemSupport(Archipelago& archipelago, const SDK::FName& vanillaShardId) {
-    SDK::FPBItemCatalogData itemData{};
-    GameManager::Instance().Player()->CharacterInventory->GetItemDataById(vanillaShardId, &itemData);
-    std::string displayName = itemData.Name.ToString();
-
-    if (!displayName.empty()) {
-        ItemLookupResult result = archipelago.GetItemLookupResult(displayName);
-        if (result != ItemLookupResult::UnknownItem) return result;
-    }
-    return archipelago.GetItemLookupResult(vanillaShardId.ToString());
 }
 
 SDK::EShardColor DefaultShardColor(SDK::EShardType shardType) {
@@ -255,23 +344,79 @@ bool RestoreVanillaShardAppearance(SDK::AShardBase* shardBase, const SDK::FName&
     return true;
 }
 
-}  // namespace
+void ReplaceItemDropperOutput(SDK::Params::PBDropManager_GetItemDroppableEnemies& params) {
+    if (!EnemyDropShuffle::IsApplied()) return;
 
-void HookManager::ResetCompatibilityShardMasterData() {
-    auto* gameInstance = static_cast<SDK::UPBGameInstance*>(GameManager::Instance().GameInstance());
-    if (gameInstance) {
-        auto* shardManager = gameInstance->GetShardManager();
-        if (shardManager && shardManager->ShardMasterTable) {
-            for (const auto& [rowName, appearance] : originalRandomizedShardAppearances) {
-                auto* row = FindShardMasterRow(shardManager->ShardMasterTable, rowName);
-                if (!row) continue;
-                row->ShardType = appearance.type;
-                row->ShardColorOverride = appearance.color;
-            }
-            originalRandomizedShardAppearances.clear();
+    std::vector<SDK::FName> enemies;
+    std::unordered_set<std::string> seen;
+    for (const auto& enemy : params.Enemies) {
+        const std::string enemyId = enemy.ToString();
+        if (!EnemyDropShuffle::IsEligibleEnemy(enemyId) && seen.insert(enemyId).second) {
+            enemies.push_back(enemy);
         }
     }
+    for (const auto& enemyId : EnemyDropShuffle::GetItemDroppers(params.ItemID.ToString())) {
+        if (seen.insert(enemyId).second) enemies.push_back(FNameFromString(enemyId));
+    }
 
+    if (static_cast<SDK::int32>(enemies.size()) > params.Enemies.MaxElements) {
+        auto* dropManager = SDK::UPBDropManager::GetDropManager();
+        SDK::TArray<SDK::FName> replacement;
+        if (dropManager && dropManager->DropTable) {
+            SDK::UDataTableFunctionLibrary::GetDataTableRowNames(dropManager->DropTable, &replacement);
+        }
+        if (static_cast<SDK::int32>(enemies.size()) > replacement.MaxElements) {
+            Logger::Log(LogLevel::File, "[DropShuffle] Could not resize item dropper archive output for:",
+                        params.ItemID.ToString(), "needed:", enemies.size());
+            return;
+        }
+
+        SDK::TArray<SDK::FName> old = params.Enemies;
+        params.Enemies = replacement;
+        replacement = old;
+        // Array_Clear is an engine-owned deallocation path. FName is trivially
+        // destructible, so the generated wildcard wrapper's int element type is safe here.
+        SDK::UKismetArrayLibrary::Array_Clear(
+            reinterpret_cast<const SDK::TArray<SDK::int32>&>(replacement));
+    }
+
+    params.Enemies.NumElements = static_cast<SDK::int32>(enemies.size());
+    for (SDK::int32 index = 0; index < params.Enemies.NumElements; ++index) {
+        params.Enemies.Data[index] = enemies[index];
+    }
+}
+
+void UnlockGebelGlassesChestAfterDenAccess() {
+    auto* gameInstance = static_cast<SDK::UPBGameInstance*>(GameManager::Instance().GameInstance());
+    auto* roomManager = GameManager::Instance().RoomManager();
+    auto* mapManager = gameInstance ? gameInstance->pMapManager : nullptr;
+    if (!gameInstance || !roomManager || !mapManager) return;
+
+    const auto glassesUnlock = FNameFromString("GotAllShard");
+    if (gameInstance->GetGimmickCategoryFlag(glassesUnlock)) return;
+
+    const std::string currentRoom = roomManager->GetCurrentRoomId().ToString();
+    bool denAccessProven = currentRoom.starts_with("m10BIG_");
+    if (!denAccessProven) {
+        // Acknowledged rooms are persistent save state, unlike the similarly named fake-moon gimmick flags.
+        // Checking several ordinary Den rooms makes this migrate existing saves even when they load in town.
+        for (const char* room : {"m10BIG_002", "m10BIG_005", "m10BIG_006", "m10BIG_007"}) {
+            if (mapManager->IsRoomAcknowledged(FNameFromString(room))) {
+                denAccessProven = true;
+                break;
+            }
+        }
+    }
+    if (!denAccessProven) return;
+
+    gameInstance->SetGimmickCategoryFlag(glassesUnlock, true);
+    Logger::Log(LogLevel::File,
+                "[AP] Enabled the Gebel's Glasses chest after persistent Den access was confirmed");
+}
+
+}  // namespace
+
+void HookManager::ResetShardDropPolicy() {
     auto* dropManager = SDK::UPBDropManager::GetDropManager();
     if (dropManager && dropManager->DropTable) {
         for (const auto& [rowName, dropFlag] : originalRandomizedDropFlags) {
@@ -282,46 +427,22 @@ void HookManager::ResetCompatibilityShardMasterData() {
     }
 }
 
-void HookManager::ApplyCompatibilityShardMasterData() {
-    auto* archipelago = Archipelago::ConnectedInstance();
-    if (!archipelago) return;
+void HookManager::ApplyShardDropPolicy() {
+    auto* archipelago = &Archipelago::Instance();
+    ResetShardDropPolicy();
 
-    ResetCompatibilityShardMasterData();
-
-    auto* gameInstance = static_cast<SDK::UPBGameInstance*>(GameManager::Instance().GameInstance());
-    if (!gameInstance) return;
-    auto* shardManager = gameInstance->GetShardManager();
-    if (!shardManager || !shardManager->ShardMasterTable) return;
     auto* dropManager = SDK::UPBDropManager::GetDropManager();
 
     const bool autoSellRepeatedShards = QualityOfLife::Instance().IsAutoSellWastedShardsEnabled();
-    size_t compatibilityRows = 0;
     size_t unsuppressedDropRows = 0;
+    size_t shuffledDropRows = 0;
     for (const auto& [randomizedName, vanillaName] : knownVanillaShardIds) {
-        SDK::FName vanillaShardId = FNameFromString(vanillaName);
-        ItemLookupResult itemResult = GetVanillaShardItemSupport(*archipelago, vanillaShardId);
-        if (itemResult == ItemLookupResult::NotReady) {
-            ResetCompatibilityShardMasterData();
-            return;
-        }
-        const bool needsCompatibility = itemResult == ItemLookupResult::UnknownItem;
-
-        if (needsCompatibility) {
-            auto* randomizedRow = FindShardMasterRow(shardManager->ShardMasterTable, randomizedName);
-            auto* vanillaRow = FindShardMasterRow(shardManager->ShardMasterTable, vanillaName);
-            if (randomizedRow && vanillaRow) {
-                originalRandomizedShardAppearances[randomizedName] =
-                    ShardAppearance{randomizedRow->ShardType, randomizedRow->ShardColorOverride};
-                randomizedRow->ShardType = vanillaRow->ShardType;
-                randomizedRow->ShardColorOverride = vanillaRow->ShardColorOverride == SDK::EShardColor::None
-                                                          ? DefaultShardColor(vanillaRow->ShardType)
-                                                          : vanillaRow->ShardColorOverride;
-                compatibilityRows++;
-            }
-        }
-
-        if ((needsCompatibility || autoSellRepeatedShards) && dropManager && dropManager->DropTable &&
-            randomizedName.starts_with("AP_")) {
+        const auto isShuffledLocation = archipelago->IsCurrentWorldLocation(randomizedName);
+        if (!isShuffledLocation) continue;
+        if (*isShuffledLocation) shuffledDropRows++;
+        const bool suppressNonLocation = !*isShuffledLocation && IsSuppressedNonLocationShard(randomizedName);
+        if ((!*isShuffledLocation || autoSellRepeatedShards) && !suppressNonLocation && dropManager &&
+            dropManager->DropTable) {
             std::string dropRowName = randomizedName.substr(3);
             auto* dropRow = FindDropMasterRow(dropManager->DropTable, dropRowName);
             if (dropRow) {
@@ -332,17 +453,42 @@ void HookManager::ApplyCompatibilityShardMasterData() {
         }
     }
 
-    Logger::Log(LogLevel::File, "[Shard] Applied shard table patches; compatibility rows:",
-                compatibilityRows, "unsuppressed drop rows:", unsuppressedDropRows,
+    // The dedicated split IDs do not have their own cooked drop rows. Unsuppress the shared source rows whenever
+    // either split location exists so a grade-9 copy of the ordinary shard cannot suppress the AP check.
+    if (dropManager && dropManager->DropTable) {
+        for (const auto& sharedLocation : sharedShardLocations) {
+            const auto isShuffledLocation = archipelago->IsCurrentWorldLocation(sharedLocation.locationShardId);
+            if (!isShuffledLocation || !*isShuffledLocation) continue;
+
+            const std::string sourceRowName = std::string(sharedLocation.sharedDropShardId).substr(3);
+            auto* dropRow = FindDropMasterRow(dropManager->DropTable, sourceRowName);
+            if (!dropRow) continue;
+            if (!originalRandomizedDropFlags.contains(sourceRowName)) {
+                originalRandomizedDropFlags[sourceRowName] = dropRow->DropSpecialFlags;
+                unsuppressedDropRows++;
+            }
+            dropRow->DropSpecialFlags = SDK::EDropSpecialFlag::None;
+        }
+    }
+
+    Logger::Log(LogLevel::File, "[Shard] Applied current shard drop policy; shuffled location rows:",
+                shuffledDropRows, "unsuppressed drop rows:", unsuppressedDropRows,
                 "auto-sell repeats:", autoSellRepeatedShards);
 }
 
 bool HookManager::Init() {
     MH_Initialize();
 
+    if (!InstallRandomizedDlcGrantHooks()) {
+        Logger::Log(LogLevel::File, "[AP] Failed to install randomized-DLC grant suppression");
+        return false;
+    }
+
     constexpr SDK::int32 ProcessLocalScriptFunction = 0x0674B520;
     void* processEventPtr = (void*)(SDK::InSDKUtils::GetImageBase() + SDK::Offsets::ProcessEvent);
     void* processLocalScriptFunctionPtr = (void*)(SDK::InSDKUtils::GetImageBase() + ProcessLocalScriptFunction);
+    void* useConsumablePtr = (void*)(SDK::InSDKUtils::GetImageBase() + USE_CONSUMABLE_NATIVE);
+    void* roomTransitionPtr = (void*)(SDK::InSDKUtils::GetImageBase() + ROOM_TRANSITION_NATIVE);
     if (!processEventPtr) {
         Logger::Log(LogLevel::Error, "Failed to get ProcessEvent address");
         return false;
@@ -355,12 +501,24 @@ bool HookManager::Init() {
     MH_STATUS peStatus = MH_CreateHook(processEventPtr, &HOOKED_ProcessEvent, (void**)&originalProcessEvent);
     MH_STATUS plsfStatus = MH_CreateHook(processLocalScriptFunctionPtr, &HOOKED_ProcessLocalScriptFunction,
                                          (void**)&originalProcessLocalScriptFunction);
+    MH_STATUS useConsumableStatus =
+        MH_CreateHook(useConsumablePtr, &HOOKED_UseConsumable, (void**)&originalUseConsumable);
+    MH_STATUS roomTransitionStatus =
+        MH_CreateHook(roomTransitionPtr, &HOOKED_RoomTransition, (void**)&originalRoomTransition);
     if (peStatus != MH_OK) {
         Logger::Log(LogLevel::Error, "pe MH_CreateHook failed: ", (int)peStatus);
         return false;
     }
     if (plsfStatus != MH_OK) {
         Logger::Log(LogLevel::Error, "plsf MH_CreateHook failed: ", (int)plsfStatus);
+        return false;
+    }
+    if (useConsumableStatus != MH_OK) {
+        Logger::Log(LogLevel::Error, "UseConsumable MH_CreateHook failed: ", (int)useConsumableStatus);
+        return false;
+    }
+    if (roomTransitionStatus != MH_OK) {
+        Logger::Log(LogLevel::Error, "RoomTransition MH_CreateHook failed: ", (int)roomTransitionStatus);
         return false;
     }
 
@@ -374,15 +532,28 @@ bool HookManager::Init() {
         Logger::Log(LogLevel::Error, "plsf MH_EnableHook failed: ", (int)plsfStatus);
         return false;
     }
+    useConsumableStatus = MH_EnableHook(useConsumablePtr);
+    if (useConsumableStatus != MH_OK) {
+        Logger::Log(LogLevel::Error, "UseConsumable MH_EnableHook failed: ", (int)useConsumableStatus);
+        return false;
+    }
+    roomTransitionStatus = MH_EnableHook(roomTransitionPtr);
+    if (roomTransitionStatus != MH_OK) {
+        Logger::Log(LogLevel::Error, "RoomTransition MH_EnableHook failed: ", (int)roomTransitionStatus);
+        return false;
+    }
 
     // When game and player completely load in
     NotifyOnClassFunction("PBGameMode_Miriam_BP_C", "OnLoadGameCompletely", [](void* obj) {
         // The title world and its widgets have already been destroyed by this point.
         // Drop our stale references without invoking a method on the dead widget.
         MainMenuStatus::Instance().Forget();
+        GameManager::Instance().RestoreRandomizedDlcCatalogRowsAfterNewGameInit();
         GameManager::Instance().PlayerAlive();
+        ThreadQueue::Instance().Enqueue([] { GameManager::Instance().ApplyWaystoneSafety(); });
         InGameTracker::Instance().LoadDisplayMode();
         QualityOfLife::Instance().LoadSettings();
+        QualityOfLife::Instance().AcceptAvailableBountyHunts();
         InGameTracker::Instance().InvalidateReachability("save loaded");
         Archipelago::Instance().ResetLocalLocationCache();
         Archipelago::Instance().ApplySavedEnemyDropShuffle();
@@ -391,21 +562,95 @@ bool HookManager::Init() {
         Logger::Log("Player respawned");
     });
 
-    NotifyOnClassFunction("TitleMainMenu_C", "Tick",
-                          [](void* obj) { MainMenuStatus::Instance().Show(static_cast<SDK::UObject*>(obj)); });
+    NotifyOnClassFunction("TitleMainMenu_C", "Tick", [](void* obj) {
+        GameManager::Instance().PrimeOwnedPaidDlcCatalogRows();
+        MainMenuStatus::Instance().Show(static_cast<SDK::UObject*>(obj));
+    });
 
     Logger::Log("HookManager initialized successfully");
     return true;
 }
 
+bool HookManager::HOOKED_UseConsumable(SDK::UPBCharacterInventoryComponent* inventory, SDK::FName itemId,
+                                       bool noRemove, bool byFamilia) {
+    auto* gameInstance = static_cast<SDK::UPBGameInstance*>(GameManager::Instance().GameInstance());
+    auto* mapManager = gameInstance ? gameInstance->pMapManager : nullptr;
+    const auto townRoom = FNameFromString(std::string(TOWN_WAYSTONE_ROOM));
+    const bool armRedirect = itemId.ToString() == WAYSTONE_ITEM_ID && mapManager &&
+                             !mapManager->IsRoomAcknowledged(townRoom);
+    if (armRedirect) pendingPreTownWaystone = true;
+
+    const bool used = originalUseConsumable(inventory, itemId, noRemove, byFamilia);
+    if (armRedirect && !used) pendingPreTownWaystone = false;
+    return used;
+}
+
+bool HookManager::HOOKED_RoomTransition(SDK::UPBRoomManager* roomManager, SDK::FName roomId,
+                                        bool transitionFlag, SDK::FName preferredSpawnPointName,
+                                        const SDK::FLinearColor* fadeColor) {
+    if (pendingPreTownWaystone && roomId.ToString() == TOWN_WAYSTONE_ROOM) {
+        pendingPreTownWaystone = false;
+        roomId = FNameFromString(std::string(GAME_START_ROOM));
+        preferredSpawnPointName = FNameFromString("None");
+        Logger::Log(LogLevel::File, "[AP] Redirected pre-town Waystone to game start room");
+    }
+    return originalRoomTransition(roomManager, roomId, transitionFlag, preferredSpawnPointName, fadeColor);
+}
+
 bool HookManager::PostInit() {
-    NotifyOnClassFunction("MapManageBlueprint_C", "Event_MapStart",
-                          [](void* obj) { InGameTracker::Instance().ApplyMapMarkers(obj); });
-    NotifyOnClassFunction("MapManageBlueprint_C", "Tick",
-                          [](void* obj) { InGameTracker::Instance().ApplyDeferredGhostMap(obj); });
+    UnlockGebelGlassesChestAfterDenAccess();
+    NotifyOnClassFunctionWithParams(
+        "PBDropManager", "GetItemDroppableEnemies",
+        [](void*, const std::string& functionName, void* rawParams) {
+            if (functionName != "GetItemDroppableEnemies" || !rawParams) return;
+            ReplaceItemDropperOutput(
+                *static_cast<SDK::Params::PBDropManager_GetItemDroppableEnemies*>(rawParams));
+        });
+
+    NotifyOnClassFunction(
+        "LIB_009_Chair_BP_C",
+        "BndEvt__PBET_OnInteractBox_K2Node_ComponentBoundEvent_0_PBETDelegate_OnBeginOverlapPC__DelegateSignature",
+        [](void*) {
+            auto* gameInstance = static_cast<SDK::UPBGameInstance*>(GameManager::Instance().GameInstance());
+            if (!gameInstance) return;
+
+            const auto firstReward = FNameFromString("LIB_009_PushUpOD_First");
+            const auto secondReward = FNameFromString("LIB_009_PushUpOD_Second");
+            if (gameInstance->GetGimmickCategoryFlag(firstReward) &&
+                gameInstance->GetGimmickCategoryFlag(secondReward)) {
+                return;
+            }
+
+            gameInstance->SetGimmickCategoryFlag(firstReward, true);
+            gameInstance->SetGimmickCategoryFlag(secondReward, true);
+        });
+
+    NotifyOnClassFunction("MapManageBlueprint_C", "Event_MapStart", [](void* obj) {
+        InGameTracker::Instance().ReactivateMiniMapForMenu();
+        InGameTracker::Instance().ApplyMapMarkers(obj);
+    });
+    NotifyOnClassFunction("MapManageBlueprint_C", "Tick", [](void* obj) {
+        InGameTracker::Instance().ApplyDeferredGhostMap(obj);
+        // This callback runs after the complete map-manager Tick, including MiniMapBlueprint's internal local-script
+        // Setup/UpdateIcons calls. Reassert custom marker state only after all native reconstruction has finished.
+        InGameTracker::Instance().ReassertMiniMapCustomMarker(nullptr);
+    });
     NotifyOnClassFunction("MiniMapBlueprint_C", "Tick",
                           [](void* obj) { InGameTracker::Instance().ApplyMiniMap(obj); });
-
+    NotifyOnClassFunctionWithParams(
+        "MiniMapBlueprint_C", "OnPaint",
+        [](void* obj, const std::string& functionName, void* rawParams) {
+            if (functionName == "OnPaint") {
+                InGameTracker::Instance().PaintMiniMap(obj, rawParams);
+            }
+        });
+    NotifyOnClassFunctionWithParams(
+        "TotalMapBlueprint_C", "OnPaint",
+        [](void* obj, const std::string& functionName, void* rawParams) {
+            if (functionName == "OnPaint") {
+                InGameTracker::Instance().PaintMiniMap(obj, rawParams);
+            }
+        });
     NotifyOnClassFunctionWithParams(
         "PBCharacterInventoryComponent", "GetItemWithDisplay",
         [](void* obj, const std::string& functionName, void* rawParams) {
@@ -415,37 +660,53 @@ bool HookManager::PostInit() {
             if (params->Quantity <= 0 || !params->ReturnValue) return;
 
             const std::string nativeItemId = params->newItemId.ToString();
-            if (!nativeItemId.empty()) InGameTracker::Instance().ObserveNativeItem(nativeItemId);
+            if (nativeItemId.empty()) return;
+            InGameTracker::Instance().ObserveNativeItem(nativeItemId);
+            if (nativeItemId.starts_with("AP_")) {
+                Archipelago::Instance().SendLocationChecks(nativeItemId);
+            }
         });
 
     // Whens constantly when the player is alive
     NotifyOnClassFunction("Chr_P0000_C", "GetAdditionalCameraTargetLocations", [](void* obj) {
-        if (!Archipelago::ConnectedInstance()) return;
-        if (!Archipelago::ConnectedInstance()->IsPendingDeathlink()) return;
+        // Quantity is per-save inventory state rather than an ItemMaster default. Reassert it continuously so
+        // every native and Blueprint Waystone-use path observes the same infinite-five invariant.
+        GameManager::Instance().ApplyWaystoneSafety();
+        QualityOfLife::Instance().TickAutoAcceptBountyHunts();
+        auto* archipelago = Archipelago::ConnectedInstance();
+        if (!archipelago || !archipelago->IsPendingDeathlink()) return;
 
-        Logger::Log("Pending death link is true");
-        // is pending death link is true
-        if (GameManager::Instance().CanKillPlayer() && !GameManager::Instance().IsPlayerDead()) {
-            Logger::Log("Killing player from deathlink");
-            GameManager::Instance().KillPlayer();
-            Logger::Log("Killed player");
+        switch (archipelago->GetDeathLinkMode()) {
+            case DeathLinkMode::Off:
+                archipelago->ResetDeathLink();
+                break;
+            case DeathLinkMode::Waystone:
+                if (!GameManager::Instance().IsPlayerDead() && GameManager::Instance().CanKillPlayer() &&
+                    GameManager::Instance().TryUseWaystone()) {
+                    archipelago->ResetDeathLink();
+                    Logger::Log(LogLevel::File, "[AP] Applied DeathLink consequence: Waystone");
+                }
+                break;
+            case DeathLinkMode::GameOver:
+                if (GameManager::Instance().CanKillPlayer() && !GameManager::Instance().IsPlayerDead()) {
+                    Logger::Log(LogLevel::File, "[AP] Applying DeathLink consequence: Game Over");
+                    GameManager::Instance().KillPlayer();
+                }
+                break;
         }
     });
 
     // When player dies
     NotifyOnClassFunction("Chr_P0000_C", "Kill", [](void* obj) {
-        Logger::Log("Player died");
         GameManager::Instance().PlayerDied();
-        Logger::Log("Pending death link", Archipelago::ConnectedInstance()->IsPendingDeathlink());
-        // pending death is true
-        if (!Archipelago::ConnectedInstance()->IsPendingDeathlink()) {
-            Logger::Log("Sent out death link");
-            Archipelago::ConnectedInstance()->InvokeDeathLink();  // send out death link
+        auto* archipelago = Archipelago::ConnectedInstance();
+        if (!archipelago) return;
+
+        if (!archipelago->IsPendingDeathlink()) {
+            archipelago->InvokeDeathLink();
         } else {
-            Archipelago::ConnectedInstance()->ResetDeathLink();
-            Logger::Log("Resetting death link");
+            archipelago->ResetDeathLink();
         }
-        Logger::Log("End of player died");
     });
 
     // When player returns to title screen
@@ -465,8 +726,8 @@ bool HookManager::PostInit() {
     // When player changes room
     NotifyOnClassFunction("PBRoomManager", "OnSerializeGame", [](void* obj) {
         std::string currentRoomId = GameManager::Instance().RoomManager()->GetCurrentRoomId().ToString();
-        SDK::UPBGameInstance in;
         Logger::Log("Changed rooms:", currentRoomId);
+        UnlockGebelGlassesChestAfterDenAccess();
     });
 
     // When player saves
@@ -484,8 +745,7 @@ bool HookManager::PostInit() {
         auto shardId = shardBase->ShardId;
         std::string shardName = shardId.ToString();
         if (!shardName.starts_with("AP_")) return;
-        auto* archipelago = Archipelago::ConnectedInstance();
-        if (!archipelago) return;
+        auto* archipelago = &Archipelago::Instance();
 
         auto vanillaShardId = ResolveVanillaShardId(shardId);
         if (!vanillaShardId) {
@@ -493,20 +753,22 @@ bool HookManager::PostInit() {
             return;
         }
 
-        ItemLookupResult itemResult = GetVanillaShardItemSupport(*archipelago, *vanillaShardId);
-        if (itemResult == ItemLookupResult::NotReady) {
-            Logger::Log("[Shard] Item data is not ready; leaving shard actor intact:", shardName);
-            return;
-        }
-        if (itemResult == ItemLookupResult::UnknownItem) {
+        const auto isShuffledLocation = archipelago->IsCurrentWorldLocation(shardName);
+        if (!isShuffledLocation) return;
+        if (!*isShuffledLocation) {
+            if (IsSuppressedNonLocationShard(shardName)) {
+                Logger::Log(LogLevel::File, "[Shard] Suppressed non-location shard source:", shardName);
+                ((SDK::AActor*)(shardBase))->K2_DestroyActor();
+                return;
+            }
             RestoreVanillaShardAppearance(shardBase, *vanillaShardId);
             return;
         }
 
         LocationCheckResult checkResult = archipelago->SendLocationChecks(shardName);
         if (checkResult == LocationCheckResult::NotReady) {
-            Logger::Log("[Shard] World data is not ready; leaving vanilla shard actor intact:", shardName);
-            return;
+            Logger::Log(LogLevel::File,
+                        "[Shard] Journaled shuffled shard while disconnected and suppressed actor:", shardName);
         }
 
         if (checkResult == LocationCheckResult::UnknownLocation) {
@@ -547,24 +809,62 @@ void HookManager::ProcessEventBefore(SDK::UObject* obj, SDK::UFunction* func, vo
     QualityOfLife::Instance().ProcessEventBefore(obj, func, params);
     std::string functionName = func->Name.GetRawString();
 
+    // Breeder's shard is a scripted direct inventory grant rather than a PurpleShard actor. Arm the remap only
+    // for this boss death so receiving Familiar: Archer as an AP item while visiting Dead Lands remains untouched.
+    if (functionName == "BP_OnKilled" && obj->Class->Name.ToString() == "Chr_N2016_C") {
+        const auto isShuffledLocation =
+            Archipelago::Instance().IsCurrentWorldLocation(std::string(FAMILIA_ARCHER_LOCATION_ID));
+        pendingBreederFamiliarArcherReward = isShuffledLocation.value_or(false);
+    }
+
+    if (functionName == "OpenTreasureBox" &&
+        obj->IsA(SDK::APBBronzeTreasureBox_BP_C::StaticClass())) {
+        InGameTracker::Instance().AuditOpenedChestPosition(obj);
+    }
+
+    // The static pak disables paid-DLC ItemMaster rows so vanilla cannot grant
+    // cosmetic-pack starter equipment. Existing saves need those rows restored
+    // before inventory regeneration, but a newly confirmed save must put them
+    // back before its initial vanilla grant pass begins.
+    if (functionName == "EntryNameConfirmYes" && obj->Class &&
+        obj->Class->Name.ToString() == "EntryNameSetter_C") {
+        GameManager::Instance().SuppressRandomizedDlcCatalogRowsForNewGame();
+    }
+
+    // Location placeholders must remain in the vanilla inventory so the native pickup remains durable, but their
+    // internal AP_* names are implementation details and must never produce a player-facing item popup. The
+    // post-event callback journals the successful grant directly, so suppressing display cannot lose the check.
+    if (params && functionName == "GetItemWithDisplay" &&
+        obj->Class->Name.ToString() == "PBCharacterInventoryComponent") {
+        auto* itemParams = static_cast<SDK::Params::PBCharacterInventoryComponent_GetItemWithDisplay*>(params);
+        if (pendingBreederFamiliarArcherReward && itemParams->newItemId.ToString() == "FamiliaArcher") {
+            itemParams->newItemId = FNameFromString(std::string(FAMILIA_ARCHER_LOCATION_ID));
+            pendingBreederFamiliarArcherReward = false;
+            Logger::Log(LogLevel::File,
+                        "[Shard] Remapped Breeder's scripted Familiar: Archer reward to AP location");
+        }
+        if (itemParams->newItemId.ToString().starts_with("AP_")) itemParams->isDisplay = false;
+    }
+
     if (functionName == "QuitGame" || functionName == "QuitGameYes") {
         shuttingDown = true;
         Archipelago::Instance().Shutdown();
     }
 
-    // UserConstructionScript selects the shard actor's material. Restore the vanilla
-    // ID before that script runs so compatibility shards use their real category color.
+    // UserConstructionScript selects the shard actor's material. In current-schema
+    // vanilla-shard mode, restore the native ID before that selection runs.
     if (functionName == "UserConstructionScript" && obj->Class->Name.ToString() == "PurpleShard_C") {
         auto* shardBase = static_cast<SDK::AShardBase*>(obj);
         std::string shardName = shardBase->ShardId.ToString();
-        auto* archipelago = Archipelago::ConnectedInstance();
-        if (!archipelago || !shardName.starts_with("AP_")) return;
+        auto* archipelago = &Archipelago::Instance();
+        if (!shardName.starts_with("AP_")) return;
 
         auto vanillaShardId = ResolveVanillaShardId(shardBase->ShardId);
         if (!vanillaShardId) return;
 
-        ItemLookupResult itemResult = GetVanillaShardItemSupport(*archipelago, *vanillaShardId);
-        if (itemResult != ItemLookupResult::UnknownItem) return;
+        const auto isShuffledLocation = archipelago->IsCurrentWorldLocation(shardName);
+        if (!isShuffledLocation || *isShuffledLocation) return;
+        if (IsSuppressedNonLocationShard(shardName)) return;
 
         RestoreVanillaShardAppearance(shardBase, *vanillaShardId);
         return;
@@ -574,8 +874,23 @@ void HookManager::ProcessEventBefore(SDK::UObject* obj, SDK::UFunction* func, vo
 
     auto* crystallizeParams = static_cast<SDK::Params::PBBaseCharacter_CrystallizeDead*>(params);
     std::string shardName = crystallizeParams->DropShardId.ToString();
-    auto* archipelago = Archipelago::ConnectedInstance();
-    if (!archipelago || !shardName.starts_with("AP_")) return;
+    auto* archipelago = &Archipelago::Instance();
+
+    const std::string characterClass = obj->Class ? obj->Class->Name.ToString() : "";
+    for (const auto& sharedLocation : sharedShardLocations) {
+        if (characterClass != sharedLocation.characterClass) continue;
+
+        const auto isSplitLocation = archipelago->IsCurrentWorldLocation(sharedLocation.locationShardId);
+        if (!isSplitLocation || !*isSplitLocation) break;
+
+        crystallizeParams->DropShardId = FNameFromString(sharedLocation.locationShardId);
+        Logger::Log(LogLevel::File, "[Shard] Remapped shared enemy shard location:", characterClass,
+                    "source:", shardName, "location:", sharedLocation.locationShardId);
+        shardName = sharedLocation.locationShardId;
+        break;
+    }
+
+    if (!shardName.starts_with("AP_")) return;
 
     auto vanillaShardId = ResolveVanillaShardId(crystallizeParams->DropShardId);
     if (!vanillaShardId) {
@@ -583,8 +898,9 @@ void HookManager::ProcessEventBefore(SDK::UObject* obj, SDK::UFunction* func, vo
         return;
     }
 
-    ItemLookupResult itemResult = GetVanillaShardItemSupport(*archipelago, *vanillaShardId);
-    if (itemResult != ItemLookupResult::UnknownItem) return;
+    const auto isShuffledLocation = archipelago->IsCurrentWorldLocation(shardName);
+    if (!isShuffledLocation || *isShuffledLocation) return;
+    if (IsSuppressedNonLocationShard(shardName)) return;
 
     crystallizeParams->DropShardId = *vanillaShardId;
 }

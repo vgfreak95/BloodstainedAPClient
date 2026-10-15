@@ -16,6 +16,8 @@ class QualityOfLife {
     void LoadSettings();
     void SetAutoSellWastedShardsEnabled(bool enabled);
 
+    void AcceptAvailableBountyHunts(bool logWhenNoChanges = true);
+    void TickAutoAcceptBountyHunts();
     void SellRepeatedShardNow(const SDK::FName& vanillaShardId);
     void ProcessEventBefore(SDK::UObject* obj, SDK::UFunction* func, void* params);
 

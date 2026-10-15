@@ -17,16 +17,20 @@ using json = nlohmann::json;
 
 enum class ItemGrantResult;
 
+enum class DeathLinkMode : int32_t {
+    Off = 0,
+    Waystone = 1,
+    GameOver = 2,
+};
+
 struct ArchipelagoConnectionInfo {
     std::string uri;
     std::string slotName;
     std::string password;
-    bool wantsDeathlink = false;
+    DeathLinkMode deathLinkMode = DeathLinkMode::Off;
 };
 
 enum class LocationCheckResult { NotReady, UnknownLocation, AlreadyChecked, Sent };
-
-enum class ItemLookupResult { NotReady, UnknownItem, KnownItem };
 
 enum class ArchipelagoConnectionState {
     Disconnected = 0,
@@ -56,9 +60,12 @@ class Archipelago {
     void SetLastError(const std::string error) const { lastError_ = error; };
     bool IsPendingDeathlink() const { return pendingDeathlink_; };
     void ResetDeathLink() const { pendingDeathlink_ = false; };
+    DeathLinkMode GetDeathLinkMode() const { return deathLinkMode_; }
+    void SetDeathLinkMode(DeathLinkMode deathLinkMode);
 
     // AP Actions
-    bool Connect(const std::string& slotName, const std::string& password, std::string uri, const bool& wantsDeathlink);
+    bool Connect(const std::string& slotName, const std::string& password, std::string uri,
+                 DeathLinkMode deathLinkMode);
     void Disconnect();
     void Shutdown();
     void Poll();
@@ -68,7 +75,7 @@ class Archipelago {
     std::optional<ArchipelagoConnectionInfo> LoadSavedConnectionInfo() const;
 
     LocationCheckResult SendLocationChecks(const std::string& locationId);
-    ItemLookupResult GetItemLookupResult(const std::string& itemName) const;
+    std::optional<bool> IsCurrentWorldLocation(const std::string& locationId) const;
     bool IsMissingLocation(const std::string& locationName, std::uint64_t expectedId) const;
     bool WasLocationClearedLocally(const std::string& locationName);
     std::unordered_map<std::string, std::uint32_t> GetTrackerInventory() const;
@@ -83,18 +90,22 @@ class Archipelago {
     void AbortPassword();
     void ConnectSlot();
     void LoadClearedLocations();
-    void LoadLocalProgress();
+    void LoadPendingClearedLocations();
+    bool LoadLocalProgress();
     void ProcessReceivedItems();
     void CompleteReceivedItem(int64_t itemIndex, int64_t itemId, const std::string& itemName,
                               const std::string& savePrefix, uint64_t generation, ItemGrantResult result);
-    void LoadItemLedger();
+    bool LoadEntitlementLedger();
     void PersistAwardedItemCounts() const;
-    void PersistObservedItemLedger() const;
-    void UpdateObservedItemLedger();
     void ReconcileReceivedProgressionInventory();
     void ReconcileCompletedBossShardLocations();
-    void TryMigrateLegacyProgress();
+    bool ValidateRequiredDlcLocations();
+    bool ValidateSlotAndSave(const json& slotData);
+    bool HasCurrentSaveSchema() const;
+    bool HasLegacySaveState() const;
     void RecordClearedLocation(const std::string& locationId);
+    void RecordPendingClearedLocation(const std::string& locationId);
+    void PromotePendingClearedLocations();
     void SaveConnectionInfo() const;
     bool ApplyConnectedEnemyDropShuffle(const std::string& seedName, std::uint32_t slotId);
     void SaveLocalInt64(const std::string& name, int64_t value) const;
@@ -112,30 +123,26 @@ class Archipelago {
     std::string slotName_;
     std::string password_;
     std::string localSavePrefix_;
-    std::string loadedLedgerPrefix_;
     int itemsHandling_ = 0b111;  // Send all received items, including starting inventory
 
     mutable std::string lastError_;
-    mutable int64_t lastReceivedItemIndex_ = -1;
-    int64_t lastQueuedItemIndex_ = -1;
-    std::optional<int32_t> legacyReceivedItemIndex_;
     mutable bool pendingDeathlink_ = false;
-    mutable bool wantsDeathlink_ = false;
+    mutable DeathLinkMode deathLinkMode_ = DeathLinkMode::Off;
     bool localProgressLoaded_ = false;
     bool processingReceivedItems_ = false;
     bool receivedItemGrantPending_ = false;
     bool receivedProgressionInventoryReconciled_ = false;
     bool clearedLocationsLoaded_ = false;
-    bool itemLedgerLoaded_ = false;
+    bool pendingClearedLocationsLoaded_ = false;
+    bool worldLocationSnapshotReady_ = false;
     std::atomic_flag polling_ = ATOMIC_FLAG_INIT;
     std::chrono::steady_clock::time_point receivedItemRetryAt_{};
     uint64_t receivedItemGeneration_ = 0;
 
-    std::map<int64_t, APClient::NetworkItem> pendingReceivedItems_;
     std::map<int64_t, APClient::NetworkItem> receivedItems_;
-    std::map<int64_t, int64_t> observedItemIdsByIndex_;
     std::unordered_map<int64_t, std::uint32_t> awardedItemCounts_;
     std::vector<std::string> clearedLocations_;
+    std::vector<std::string> pendingClearedLocations_;
     json slotData_;
 
     int64_t shardDropInitialGrade_ = 1;

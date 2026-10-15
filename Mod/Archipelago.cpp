@@ -9,20 +9,23 @@
 #include <array>
 #include <cstdint>
 #include <exception>
-#include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <set>
 #include <string_view>
 #include <utility>
 
 #include "ClientVersion.h"
+#include "ConnectionUri.h"
 #include "EnemyDropShuffle.h"
 #include "EnemyDropShuffleLogic.h"
 #include "GameManager.h"
 #include "HookManager.h"
 #include "InGameTracker.h"
 #include "Logger.h"
+#include "MainMenuStatus.h"
+#include "ProgressiveItems.h"
 #include "ThreadQueue.h"
 #include "TrackerData.generated.h"
 #include "Utils.h"
@@ -41,17 +44,24 @@ const APClient::Version CLIENT_VERSION = {ClientVersion::ArchipelagoProtocol::Ma
 std::string game_seed;
 const int MAX_SEED_LENGTH = 32;
 
-const std::string ITEM_INDEX_SAVE_VALUE = "ItemIndex";
-const std::string ITEM_LEDGER_VERSION_VALUE = "ItemLedgerVersion";
-const std::string ITEM_LEDGER_OBSERVED_COUNT_VALUE = "ItemLedgerObservedCount";
-const std::string ITEM_LEDGER_AWARDED_COUNT_VALUE = "ItemLedgerAwardedCount";
+const std::string LEGACY_ITEM_INDEX_SAVE_VALUE = "ItemIndex";
+const std::string LEGACY_ITEM_LEDGER_VERSION_VALUE = "ItemLedgerVersion";
+const std::string ENTITLEMENT_LEDGER_VERSION_VALUE = "EntitlementLedgerVersion";
+const std::string ENTITLEMENT_LEDGER_COUNT_VALUE = "EntitlementLedgerCount";
 const std::string CONNECTION_SAVE_PREFIX = "AP_LastConnection_";
 const std::string CLEARED_LOCATION_SAVE_PREFIX = "AP_ClearedLocation_";
+const std::string PENDING_CLEARED_LOCATION_SAVE_PREFIX = "AP_PendingClearedLocation_";
 const std::string ENEMY_DROP_SHUFFLE_SEED_VALUE = "AP_EnemyDropShuffleSeed";
 const std::string ENEMY_DROP_SHUFFLE_VERSION_VALUE = "AP_EnemyDropShuffleVersion";
-const int32_t CONNECTION_SAVE_VERSION = 1;
-const int32_t ITEM_LEDGER_VERSION = 1;
+const std::string STATIC_PAK_SAVE_SCHEMA_VALUE = "AP_StaticPakSaveSchema";
+const std::string LEGACY_CONTENT_POLICY = "base-and-free-content-v1";
+const std::string CONTENT_POLICY = "base-free-and-optional-paid-dlc-v2";
+const int32_t STATIC_PAK_SCHEMA = 1;
+const int32_t CONNECTION_SAVE_VERSION = 3;
+const int32_t LEGACY_BOOLEAN_DEATHLINK_CONNECTION_SAVE_VERSION = 2;
+const int32_t ENTITLEMENT_LEDGER_VERSION = 1;
 const int32_t MAX_ITEM_LEDGER_ENTRIES = 4096;
+const int32_t LEGACY_SAVE_SLOT_SCAN_LIMIT = 100;
 const size_t MAX_CONNECTION_FIELD_LENGTH = 1024;
 const int32_t MAX_CLEARED_LOCATIONS = 4096;
 const std::chrono::milliseconds ITEM_GRANT_INTERVAL(100);
@@ -60,9 +70,20 @@ const std::chrono::milliseconds ITEM_GRANT_RETRY_DELAY(500);
 // These enemies award their shard exactly once, as part of their boss defeat sequence. If the client was not able
 // to observe that short-lived shard actor, the save's completed-boss flag is the authoritative durable evidence
 // that the corresponding location was cleared.
-constexpr std::array<std::string_view, 13> BOSS_SHARD_ENEMY_IDS = {
-    "N1001", "N1002", "N1003", "N1004", "N1005", "N1006", "N1008",
-    "N2001", "N2004", "N2006", "N2007", "N2012", "N2013",
+struct BossShardLocation {
+    std::string_view boss_id;
+    std::string_view location_id;
+};
+
+constexpr std::array BOSS_SHARD_LOCATIONS = {
+    BossShardLocation{"N1001", "N1001_Shard"}, BossShardLocation{"N1002", "N1002_Shard"},
+    BossShardLocation{"N1003", "N1003_Shard"}, BossShardLocation{"N1004", "N1004_Shard"},
+    BossShardLocation{"N1005", "N1005_Shard"}, BossShardLocation{"N1006", "N1006_Shard"},
+    BossShardLocation{"N1008", "N1008_Shard"}, BossShardLocation{"N2001", "N2001_Shard"},
+    BossShardLocation{"N2004", "N2004_Shard"}, BossShardLocation{"N2006", "N2006_Shard"},
+    BossShardLocation{"N2007", "N2007_Shard"}, BossShardLocation{"N2012", "N2012_Shard"},
+    BossShardLocation{"N2013", "N2013_Shard"}, BossShardLocation{"N2016", "FamiliaArcher_Shard"},
+    BossShardLocation{"N2017", "N2017_Shard"},
 };
 
 #define UUID_FILE "uuid"
@@ -73,6 +94,17 @@ using json = nlohmann::json;
 static std::optional<int32_t> LoadSavedValue(const std::string& saveValueName);
 static std::optional<std::string> LoadSavedString(const std::string& saveValueName);
 
+static std::string_view GetCurrentDifficultyName() {
+    switch (SDK::UPBGameInstance::GetGameLevel()) {
+        case SDK::EPBGameLevel::Hard:
+            return "hard";
+        case SDK::EPBGameLevel::Nightmare:
+            return "nightmare";
+        default:
+            return "normal";
+    }
+}
+
 static std::optional<int64_t> LoadInt64(const std::string& name) {
     const auto low = LoadSavedValue(name + "Low");
     const auto high = LoadSavedValue(name + "High");
@@ -82,6 +114,7 @@ static std::optional<int64_t> LoadInt64(const std::string& name) {
 }
 
 static bool IsShardOrSkillItem(const std::string& itemId) {
+    if (GameManager::Instance().IsPaidDlcShard(itemId)) return true;
     return GameManager::Instance().ItemHasItemCategories(
         itemId, {SDK::ECarriedCatalog::AllShard, SDK::ECarriedCatalog::TriggerShard,
                  SDK::ECarriedCatalog::DirectionalShard, SDK::ECarriedCatalog::EffectiveShard,
@@ -95,6 +128,11 @@ static std::optional<std::string_view> GetNativeItemName(int64_t itemId) {
                                           [](const auto& entry, std::uint64_t id) { return entry.id < id; });
     if (binding == bindings.end() || binding->id != static_cast<std::uint64_t>(itemId)) return std::nullopt;
     return binding->native_name;
+}
+
+static bool IsKnownItemId(int64_t itemId) {
+    return GetNativeItemName(itemId).has_value() ||
+           bloodstained::items::FindProgressiveItem(static_cast<std::uint64_t>(itemId)) != nullptr;
 }
 
 static std::optional<int64_t> GetItemId(std::string_view nativeName) {
@@ -116,7 +154,9 @@ static std::optional<int64_t> GetLocationId(std::string_view nativeName) {
 static std::string GetDisplayItemName(int64_t itemId) {
     if (ap && ap->is_data_package_valid()) return ap->get_item_name(itemId, ap->get_game());
     const auto nativeName = GetNativeItemName(itemId);
-    return nativeName ? std::string(*nativeName) : "Unknown item " + std::to_string(itemId);
+    if (nativeName) return std::string(*nativeName);
+    const auto* progressive = bloodstained::items::FindProgressiveItem(static_cast<std::uint64_t>(itemId));
+    return progressive ? std::string(progressive->display_name) : "Unknown item " + std::to_string(itemId);
 }
 
 Archipelago& Archipelago::Instance() {
@@ -142,7 +182,7 @@ void Archipelago::ConnectSlot() {
     if (ap) {
         if (state_ == ArchipelagoConnectionState::Connected) {
             std::list<std::string> tags;
-            if (wantsDeathlink_) {
+            if (deathLinkMode_ != DeathLinkMode::Off) {
                 tags.push_back("DeathLink");
             }
             _connected = ap->ConnectSlot(slotName_, password_, itemsHandling_, tags, CLIENT_VERSION);
@@ -160,16 +200,19 @@ void Archipelago::ConnectSlot() {
     }
 }
 
-ItemLookupResult Archipelago::GetItemLookupResult(const std::string& itemName) const {
-    if (!ap || !IsConnected()) return ItemLookupResult::NotReady;
-    return GetItemId(itemName) ? ItemLookupResult::KnownItem : ItemLookupResult::UnknownItem;
-}
-
 std::unordered_map<std::string, std::uint32_t> Archipelago::GetTrackerInventory() const {
     std::unordered_map<std::string, std::uint32_t> inventory;
     if (!ap || !IsConnected()) return inventory;
 
+    std::unordered_map<int64_t, std::uint32_t> occurrences;
     for (const auto& [index, item] : receivedItems_) {
+        // ReceivedItems is the server's complete delivery history, including entries which are still waiting
+        // behind a rejected native grant. Reachability must follow the durable award ledger, not run ahead of
+        // the player's actual inventory merely because a later item is already present in that history.
+        const auto awarded = awardedItemCounts_.find(item.item);
+        const std::uint32_t awardedOccurrences =
+            awarded == awardedItemCounts_.end() ? 0u : awarded->second;
+        if (++occurrences[item.item] > awardedOccurrences) continue;
         const std::string itemName = GetDisplayItemName(item.item);
         if (!itemName.empty()) inventory[itemName]++;
     }
@@ -230,9 +273,16 @@ static LocationResolution ResolveLocation(const std::string& locationId, const s
     return resolution;
 }
 
+std::optional<bool> Archipelago::IsCurrentWorldLocation(const std::string& locationId) const {
+    if (!worldLocationSnapshotReady_ || !ap || !locationId.starts_with("AP_")) return std::nullopt;
+    return ResolveLocation(locationId, ap->get_missing_locations(), ap->get_checked_locations()).exists;
+}
+
 void Archipelago::ResetLocalLocationCache() {
     clearedLocations_.clear();
     clearedLocationsLoaded_ = false;
+    pendingClearedLocations_.clear();
+    pendingClearedLocationsLoaded_ = false;
 }
 
 void Archipelago::LoadClearedLocations() {
@@ -272,13 +322,65 @@ void Archipelago::RecordClearedLocation(const std::string& locationId) {
     Logger::Log(LogLevel::File, "[AP] Journaled cleared location:", locationId, "index:", index);
 }
 
+void Archipelago::LoadPendingClearedLocations() {
+    if (pendingClearedLocationsLoaded_) return;
+
+    pendingClearedLocations_.clear();
+    pendingClearedLocationsLoaded_ = true;
+    const int32_t locationCount = LoadSavedValue(PENDING_CLEARED_LOCATION_SAVE_PREFIX + "Count").value_or(0);
+    if (locationCount < 0 || locationCount > MAX_CLEARED_LOCATIONS) {
+        Logger::Log(LogLevel::Error, "[AP] Invalid pending cleared-location count: ", locationCount);
+        return;
+    }
+
+    for (int32_t index = 0; index < locationCount; index++) {
+        auto location = LoadSavedString(PENDING_CLEARED_LOCATION_SAVE_PREFIX + std::to_string(index));
+        if (!location || !location->starts_with("AP_")) continue;
+        if (std::find(pendingClearedLocations_.begin(), pendingClearedLocations_.end(), *location) ==
+            pendingClearedLocations_.end()) {
+            pendingClearedLocations_.push_back(*location);
+        }
+    }
+}
+
+void Archipelago::RecordPendingClearedLocation(const std::string& locationId) {
+    LoadPendingClearedLocations();
+    if (std::find(pendingClearedLocations_.begin(), pendingClearedLocations_.end(), locationId) !=
+        pendingClearedLocations_.end()) {
+        return;
+    }
+    if (pendingClearedLocations_.size() >= static_cast<size_t>(MAX_CLEARED_LOCATIONS)) {
+        Logger::Log(LogLevel::Error, "[AP] Pending cleared-location save limit reached");
+        return;
+    }
+
+    const size_t index = pendingClearedLocations_.size();
+    SaveLocalString(PENDING_CLEARED_LOCATION_SAVE_PREFIX + std::to_string(index), locationId);
+    SaveLocalValue(PENDING_CLEARED_LOCATION_SAVE_PREFIX + "Count", static_cast<int32_t>(index + 1));
+    pendingClearedLocations_.push_back(locationId);
+    InGameTracker::Instance().ObserveLocationCleared(locationId);
+    Logger::Log(LogLevel::File, "[AP] Journaled pre-connect cleared location:", locationId, "index:", index);
+}
+
+void Archipelago::PromotePendingClearedLocations() {
+    if (!HasCurrentSaveSchema()) return;
+    LoadPendingClearedLocations();
+    if (pendingClearedLocations_.empty()) return;
+
+    const auto pending = pendingClearedLocations_;
+    for (const auto& locationId : pending) RecordClearedLocation(locationId);
+    SaveLocalValue(PENDING_CLEARED_LOCATION_SAVE_PREFIX + "Count", 0);
+    pendingClearedLocations_.clear();
+    Logger::Log(LogLevel::File, "[AP] Promoted pre-connect cleared locations:", pending.size());
+}
+
 size_t Archipelago::SendMissingClearedLocations() {
     if (!ap || !IsConnected()) return 0;
 
     LoadClearedLocations();
     const auto missingLocations = ap->get_missing_locations();
     const auto checkedLocations = ap->get_checked_locations();
-    std::set<int64_t> locations;
+    std::unordered_set<int64_t> locations;
     std::string locationNames;
     for (const auto& clearedLocation : clearedLocations_) {
         auto resolution = ResolveLocation(clearedLocation, missingLocations, checkedLocations);
@@ -293,7 +395,9 @@ size_t Archipelago::SendMissingClearedLocations() {
     Logger::Log(LogLevel::File, "[AP] Submitting missing cleared locations:", locationNames, "resolved IDs:",
                 locations.size());
     try {
-        ap->LocationChecks(std::list<int64_t>(locations.begin(), locations.end()));
+        std::list<int64_t> sortedLocations(locations.begin(), locations.end());
+        sortedLocations.sort();
+        ap->LocationChecks(sortedLocations);
     } catch (const std::exception& exception) {
         Logger::Log(LogLevel::File, "[AP] Location-check send failed; checks remain journaled for reconnect:",
                     exception.what());
@@ -310,13 +414,13 @@ void Archipelago::ReconcileCompletedBossShardLocations() {
     if (!gameInstance) return;
 
     const auto missingLocations = ap->get_missing_locations();
-    for (const std::string_view enemyId : BOSS_SHARD_ENEMY_IDS) {
-        const std::string locationName = std::string(enemyId) + "_Shard";
+    for (const auto& bossLocation : BOSS_SHARD_LOCATIONS) {
+        const std::string locationName(bossLocation.location_id);
         const auto locationId = GetLocationId(locationName);
         // Do not journal boss state for an older or differently configured world which has no such check.
         if (!locationId || !missingLocations.contains(*locationId)) continue;
 
-        if (!gameInstance->IsCompletedBoss(FNameFromString(std::string(enemyId)))) continue;
+        if (!gameInstance->IsCompletedBoss(FNameFromString(std::string(bossLocation.boss_id)))) continue;
 
         const std::string nativeLocationName = "AP_" + locationName;
         Logger::Log(LogLevel::File, "[AP] Recovered completed boss shard location from save:",
@@ -327,22 +431,33 @@ void Archipelago::ReconcileCompletedBossShardLocations() {
 
 LocationCheckResult Archipelago::SendLocationChecks(const std::string& locationId) {
     if (!locationId.starts_with("AP_")) return LocationCheckResult::UnknownLocation;
+    const bool wasClearedLocally = WasLocationClearedLocally(locationId.substr(3));
+    if (!HasCurrentSaveSchema()) {
+        RecordPendingClearedLocation(locationId);
+        return LocationCheckResult::NotReady;
+    }
     RecordClearedLocation(locationId);
-    if (!ap || !IsConnected()) return LocationCheckResult::NotReady;
+    if (!ap || !worldLocationSnapshotReady_) return LocationCheckResult::NotReady;
 
     const auto missingLocations = ap->get_missing_locations();
     const auto checkedLocations = ap->get_checked_locations();
     auto requestedLocation = ResolveLocation(locationId, missingLocations, checkedLocations);
-    SendMissingClearedLocations();
-
     if (!requestedLocation.exists) return LocationCheckResult::UnknownLocation;
+    if (!IsConnected()) {
+        return requestedLocation.missing.empty() || wasClearedLocally ? LocationCheckResult::AlreadyChecked
+                                                                      : LocationCheckResult::NotReady;
+    }
+
+    if (!wasClearedLocally && !requestedLocation.missing.empty()) {
+        InGameTracker::Instance().AuditLocationClear(locationId);
+    }
+    SendMissingClearedLocations();
     return requestedLocation.missing.empty() ? LocationCheckResult::AlreadyChecked : LocationCheckResult::Sent;
 }
 
 void Archipelago::Sync() {
     if (IsConnected() && ap) {
-        pendingReceivedItems_.clear();
-        LoadLocalProgress();
+        if (!LoadLocalProgress()) return;
         ap->Sync();
         SendMissingClearedLocations();
     }
@@ -403,7 +518,7 @@ void Archipelago::SaveConnectionInfo() const {
     SaveLocalString(CONNECTION_SAVE_PREFIX + "Slot", slotName_);
     SaveLocalString(CONNECTION_SAVE_PREFIX + "Password", password_);
 
-    SaveLocalValue(CONNECTION_SAVE_PREFIX + "DeathLink", wantsDeathlink_ ? 1 : 0);
+    SaveLocalValue(CONNECTION_SAVE_PREFIX + "DeathLink", static_cast<int32_t>(deathLinkMode_));
     SaveLocalValue(CONNECTION_SAVE_PREFIX + "Version", CONNECTION_SAVE_VERSION);
     Logger::Log("[AP] Saved successful connection info to the current save");
 }
@@ -413,6 +528,7 @@ void Archipelago::ApplySavedEnemyDropShuffle() {
     // the PAK-owned rows first so loading an older/non-AP save cannot inherit
     // the previous save's slot-specific shuffle.
     EnemyDropShuffle::Reset();
+    if (!HasCurrentSaveSchema()) return;
     const auto seed = LoadSavedValue(ENEMY_DROP_SHUFFLE_SEED_VALUE);
     const auto version = LoadSavedValue(ENEMY_DROP_SHUFFLE_VERSION_VALUE);
     if (!seed || !version) return;
@@ -442,8 +558,12 @@ bool Archipelago::ApplyConnectedEnemyDropShuffle(const std::string& seedName, st
 }
 
 std::optional<ArchipelagoConnectionInfo> Archipelago::LoadSavedConnectionInfo() const {
+    if (!HasCurrentSaveSchema()) return std::nullopt;
     auto version = LoadSavedValue(CONNECTION_SAVE_PREFIX + "Version");
-    if (!version || *version != CONNECTION_SAVE_VERSION) return std::nullopt;
+    if (!version || (*version != CONNECTION_SAVE_VERSION &&
+                     *version != LEGACY_BOOLEAN_DEATHLINK_CONNECTION_SAVE_VERSION)) {
+        return std::nullopt;
+    }
 
     auto uri = LoadSavedString(CONNECTION_SAVE_PREFIX + "Uri");
     auto slotName = LoadSavedString(CONNECTION_SAVE_PREFIX + "Slot");
@@ -451,178 +571,256 @@ std::optional<ArchipelagoConnectionInfo> Archipelago::LoadSavedConnectionInfo() 
     auto deathLink = LoadSavedValue(CONNECTION_SAVE_PREFIX + "DeathLink");
     if (!uri || !slotName || !password || !deathLink || slotName->empty()) return std::nullopt;
 
-    return ArchipelagoConnectionInfo{*uri, *slotName, *password, *deathLink != 0};
+    DeathLinkMode deathLinkMode = DeathLinkMode::Off;
+    if (*version == LEGACY_BOOLEAN_DEATHLINK_CONNECTION_SAVE_VERSION) {
+        deathLinkMode = *deathLink != 0 ? DeathLinkMode::GameOver : DeathLinkMode::Off;
+    } else if (*deathLink >= static_cast<int32_t>(DeathLinkMode::Off) &&
+               *deathLink <= static_cast<int32_t>(DeathLinkMode::GameOver)) {
+        deathLinkMode = static_cast<DeathLinkMode>(*deathLink);
+    } else {
+        return std::nullopt;
+    }
+
+    return ArchipelagoConnectionInfo{*uri, *slotName, *password, deathLinkMode};
 }
 
-void Archipelago::LoadLocalProgress() {
-    if (!ap || localSavePrefix_.empty()) return;
+bool Archipelago::HasCurrentSaveSchema() const {
+    const auto schema = LoadSavedValue(STATIC_PAK_SAVE_SCHEMA_VALUE);
+    return schema && *schema == STATIC_PAK_SCHEMA;
+}
 
-    legacyReceivedItemIndex_.reset();
-    LoadItemLedger();
-    if (itemLedgerLoaded_) {
-        lastReceivedItemIndex_ = observedItemIdsByIndex_.empty() ? -1 : observedItemIdsByIndex_.rbegin()->first;
-        lastQueuedItemIndex_ = lastReceivedItemIndex_;
-        localProgressLoaded_ = true;
-        receivedItemGrantPending_ = false;
-        receivedItemRetryAt_ = {};
-        receivedItemGeneration_++;
-        receivedProgressionInventoryReconciled_ = false;
-        Logger::Log(LogLevel::File, "[AP] Loaded item entitlement ledger; observed indices:",
-                    observedItemIdsByIndex_.size(), "awarded item types:", awardedItemCounts_.size(),
-                    "prefix:", localSavePrefix_);
-        return;
+bool Archipelago::HasLegacySaveState() const {
+    const auto connectionVersion = LoadSavedValue(CONNECTION_SAVE_PREFIX + "Version");
+    // Any AP connection state without the static-pak schema belongs to an older client. A matching connection
+    // serialization version does not make that story save compatible with the new entitlement model.
+    if (connectionVersion) return true;
+    if (LoadSavedValue(CLEARED_LOCATION_SAVE_PREFIX + "Count")) return true;
+    if (LoadSavedValue(ENEMY_DROP_SHUFFLE_SEED_VALUE) || LoadSavedValue(ENEMY_DROP_SHUFFLE_VERSION_VALUE)) {
+        return true;
+    }
+    if (localSavePrefix_.empty()) return false;
+    return LoadSavedValue(localSavePrefix_ + LEGACY_ITEM_INDEX_SAVE_VALUE).has_value() ||
+           LoadSavedValue(localSavePrefix_ + LEGACY_ITEM_LEDGER_VERSION_VALUE).has_value();
+}
+
+bool Archipelago::ValidateSlotAndSave(const json& slotData) {
+    lastError_.clear();
+    if (!slotData.is_object() || !slotData.contains("static_pak_schema") ||
+        !slotData.at("static_pak_schema").is_number_integer() ||
+        slotData.at("static_pak_schema").get<int32_t>() != STATIC_PAK_SCHEMA) {
+        lastError_ = "This slot does not use Bloodstained AP static-pak schema 1";
+        return false;
+    }
+    if (!slotData.contains("difficulty") || !slotData.at("difficulty").is_string()) {
+        lastError_ = "This slot has no Bloodstained difficulty setting";
+        return false;
+    }
+    if (!slotData.contains("content_policy") || !slotData.at("content_policy").is_string()) {
+        lastError_ = "This slot has no supported Bloodstained content policy";
+        return false;
+    }
+    const auto contentPolicy = slotData.at("content_policy").get<std::string>();
+    if (contentPolicy != LEGACY_CONTENT_POLICY && contentPolicy != CONTENT_POLICY) {
+        lastError_ = "This slot does not use a supported Bloodstained content policy";
+        return false;
     }
 
-    auto getLocalValue = [this](const std::string& name, int32_t defaultValue) {
-        std::string saveValueName = localSavePrefix_ + name;
-        std::wstring wideSaveValueName(saveValueName.begin(), saveValueName.end());
-        auto saveValueId = SDK::UKismetStringLibrary::Conv_StringToName(wideSaveValueName.c_str());
-        int32_t value = defaultValue;
-        bool isValid = false;
-        SDK::UPBGameInstance::GetSavedValue(saveValueId, &value, &isValid);
-        return isValid ? value : defaultValue;
-    };
+    const std::string expectedDifficulty = slotData.at("difficulty").get<std::string>();
+    const std::string actualDifficulty(GetCurrentDifficultyName());
+    if (expectedDifficulty != actualDifficulty) {
+        lastError_ = "Difficulty mismatch: slot expects " + expectedDifficulty + ", save is " + actualDifficulty;
+        return false;
+    }
 
-    const int32_t missingValue = std::numeric_limits<int32_t>::min();
-    int32_t itemIndex = getLocalValue(ITEM_INDEX_SAVE_VALUE, missingValue);
-    if (itemIndex == missingValue) {
-        const auto savedConnection = LoadSavedConnectionInfo();
-        auto* saveManager = SDK::UPBSaveManager::GetInstance();
-        if (savedConnection && savedConnection->slotName == slotName_ && saveManager) {
-            const int32_t saveSlotIndex = saveManager->GetLastUsedSaveSlotIndex();
-            const std::string slotSuffix = "Save" + std::to_string(saveSlotIndex) + "_";
-            const std::size_t suffixPosition = localSavePrefix_.rfind(slotSuffix);
-            if (suffixPosition != std::string::npos) {
-                const std::string legacyPrefix = localSavePrefix_.substr(0, suffixPosition);
-                std::string legacyValueName = legacyPrefix + ITEM_INDEX_SAVE_VALUE;
-                std::wstring wideLegacyValueName(legacyValueName.begin(), legacyValueName.end());
-                auto legacyValueId = SDK::UKismetStringLibrary::Conv_StringToName(wideLegacyValueName.c_str());
-                bool legacyValueValid = false;
-                SDK::UPBGameInstance::GetSavedValue(legacyValueId, &itemIndex, &legacyValueValid);
-                if (legacyValueValid) {
-                    legacyReceivedItemIndex_ = itemIndex;
-                    itemIndex = -1;
-                    Logger::Log("[AP] Found legacy item index pending save validation:",
-                                *legacyReceivedItemIndex_, "save slot:", saveSlotIndex);
-                } else {
-                    itemIndex = -1;
-                }
-            }
-        } else {
-            itemIndex = -1;
+    const auto saveSchema = LoadSavedValue(STATIC_PAK_SAVE_SCHEMA_VALUE);
+    if (saveSchema) {
+        if (*saveSchema != STATIC_PAK_SCHEMA) {
+            lastError_ = "Unsupported Bloodstained AP save schema " + std::to_string(*saveSchema);
+            return false;
         }
-        if (itemIndex == missingValue) itemIndex = -1;
+        PromotePendingClearedLocations();
+        return true;
+    }
+    if (HasLegacySaveState()) {
+        lastError_ = "Pre-1.1.0 Bloodstained AP saves are unsupported; start a new story save";
+        return false;
     }
 
-    if (itemIndex >= 0 && !legacyReceivedItemIndex_) {
-        legacyReceivedItemIndex_ = itemIndex;
-        itemIndex = -1;
-        Logger::Log(LogLevel::File, "[AP] Found pre-ledger item index pending entitlement migration:",
-                    *legacyReceivedItemIndex_);
+    SaveLocalValue(STATIC_PAK_SAVE_SCHEMA_VALUE, STATIC_PAK_SCHEMA);
+    PromotePendingClearedLocations();
+    Logger::Log(LogLevel::File, "[AP] Initialized static-pak save schema:", STATIC_PAK_SCHEMA,
+                "difficulty:", expectedDifficulty);
+    return true;
+}
+
+bool Archipelago::ValidateRequiredDlcLocations() {
+    lastError_.clear();
+    if (!ap) {
+        lastError_ = "DLC ownership could not be verified; reconnect after game initialization completes.";
+        return false;
     }
 
-    lastReceivedItemIndex_ = itemIndex;
-    lastQueuedItemIndex_ = lastReceivedItemIndex_;
-    localProgressLoaded_ = !legacyReceivedItemIndex_.has_value();
+    const auto igaShardLocation = GetLocationId("N2013_Shard");
+    if (!igaShardLocation) {
+        lastError_ = "The client has no generated binding for the IGA shard location.";
+        return false;
+    }
+
+    const bool igaShardIsActive = ap->get_missing_locations().contains(*igaShardLocation) ||
+                                  ap->get_checked_locations().contains(*igaShardLocation);
+    if (!igaShardIsActive) return true;
+
+    switch (GameManager::Instance().GetDlcOwnership("DLC_0002")) {
+        case DlcOwnership::Owned:
+            return true;
+        case DlcOwnership::NotOwned:
+            lastError_ = "This multiworld includes the IGA shard location. Purchase and install IGA's Back Pack before connecting.";
+            return false;
+        case DlcOwnership::NotReady:
+            lastError_ = "IGA's Back Pack ownership could not be verified; reconnect after DLC initialization completes.";
+            return false;
+        case DlcOwnership::NotApplicable:
+            break;
+    }
+    lastError_ = "IGA's Back Pack ownership could not be verified; reconnect after DLC initialization completes.";
+    return false;
+}
+
+bool Archipelago::LoadLocalProgress() {
+    if (!ap || localSavePrefix_.empty() || !HasCurrentSaveSchema()) return false;
+
+    localProgressLoaded_ = LoadEntitlementLedger();
     receivedItemGrantPending_ = false;
     receivedItemRetryAt_ = {};
     receivedItemGeneration_++;
     receivedProgressionInventoryReconciled_ = false;
     if (localProgressLoaded_) {
-        Logger::Log("[AP] Loaded local item index:", lastReceivedItemIndex_, "prefix:", localSavePrefix_);
+        Logger::Log(LogLevel::File, "[AP] Loaded schema-1 entitlement ledger; awarded item types:",
+                    awardedItemCounts_.size(), "prefix:", localSavePrefix_);
     }
+    return localProgressLoaded_;
 }
 
-void Archipelago::LoadItemLedger() {
-    const bool sameInMemoryLedger = loadedLedgerPrefix_ == localSavePrefix_;
-    if (!sameInMemoryLedger) {
-        observedItemIdsByIndex_.clear();
-        awardedItemCounts_.clear();
-    }
+bool Archipelago::LoadEntitlementLedger() {
+    awardedItemCounts_.clear();
 
-    itemLedgerLoaded_ = sameInMemoryLedger;
-    const auto version = LoadSavedValue(localSavePrefix_ + ITEM_LEDGER_VERSION_VALUE);
-    if (!version || *version != ITEM_LEDGER_VERSION) {
-        loadedLedgerPrefix_ = localSavePrefix_;
-        return;
-    }
-    itemLedgerLoaded_ = true;
-
-    const int32_t observedCount =
-        LoadSavedValue(localSavePrefix_ + ITEM_LEDGER_OBSERVED_COUNT_VALUE).value_or(0);
-    if (observedCount >= 0 && observedCount <= MAX_ITEM_LEDGER_ENTRIES) {
-        for (int32_t entry = 0; entry < observedCount; entry++) {
-            const std::string prefix = localSavePrefix_ + "ItemLedgerObserved" + std::to_string(entry);
-            const auto index = LoadInt64(prefix + "Index");
-            const auto itemId = LoadInt64(prefix + "Item");
-            if (index && itemId && *index >= 0) observedItemIdsByIndex_.insert_or_assign(*index, *itemId);
+    enum class LedgerLoadResult { Missing, Valid, Repaired, Invalid };
+    auto loadFromPrefix = [](const std::string& ledgerPrefix,
+                             std::unordered_map<int64_t, std::uint32_t>& output,
+                             std::string& error) {
+        output.clear();
+        const auto version = LoadSavedValue(ledgerPrefix + ENTITLEMENT_LEDGER_VERSION_VALUE);
+        if (!version) return LedgerLoadResult::Missing;
+        if (*version != ENTITLEMENT_LEDGER_VERSION) {
+            error = "Unsupported Bloodstained AP entitlement ledger version";
+            return LedgerLoadResult::Invalid;
         }
-    } else {
-        Logger::Log(LogLevel::File, "[AP] Ignoring invalid observed-item ledger count:", observedCount);
-    }
 
-    const int32_t awardedCount =
-        LoadSavedValue(localSavePrefix_ + ITEM_LEDGER_AWARDED_COUNT_VALUE).value_or(0);
-    if (awardedCount >= 0 && awardedCount <= MAX_ITEM_LEDGER_ENTRIES) {
-        for (int32_t entry = 0; entry < awardedCount; entry++) {
-            const std::string prefix = localSavePrefix_ + "ItemLedgerAwarded" + std::to_string(entry);
+        const auto awardedCountValue = LoadSavedValue(ledgerPrefix + ENTITLEMENT_LEDGER_COUNT_VALUE);
+        if (!awardedCountValue || *awardedCountValue < 0 || *awardedCountValue > MAX_ITEM_LEDGER_ENTRIES) {
+            error = "Invalid Bloodstained AP entitlement ledger count";
+            return LedgerLoadResult::Invalid;
+        }
+
+        int32_t discardedEntries = 0;
+        for (int32_t entry = 0; entry < *awardedCountValue; entry++) {
+            const std::string prefix = ledgerPrefix + "EntitlementLedger" + std::to_string(entry);
             const auto itemId = LoadInt64(prefix + "Item");
-            const int32_t count = LoadSavedValue(prefix + "Count").value_or(0);
-            if (itemId && count > 0) {
-                auto& inMemoryCount = awardedItemCounts_[*itemId];
-                inMemoryCount = std::max(inMemoryCount, static_cast<std::uint32_t>(count));
+            const auto count = LoadSavedValue(prefix + "Count");
+            if (!itemId || !count || *count <= 0 || !IsKnownItemId(*itemId)) {
+                discardedEntries++;
+                continue;
+            }
+            const auto [existing, inserted] =
+                output.emplace(*itemId, static_cast<std::uint32_t>(*count));
+            if (!inserted) {
+                existing->second = std::max(existing->second, static_cast<std::uint32_t>(*count));
+                discardedEntries++;
             }
         }
-    } else {
-        Logger::Log(LogLevel::File, "[AP] Ignoring invalid awarded-item ledger count:", awardedCount);
-    }
-    loadedLedgerPrefix_ = localSavePrefix_;
-}
+        if (discardedEntries > 0) {
+            if (output.empty()) {
+                error = "Bloodstained AP entitlement ledger contains no recoverable entries";
+                return LedgerLoadResult::Invalid;
+            }
+            error = "Recovered mixed Bloodstained AP entitlement ledger; discarded entries: " +
+                    std::to_string(discardedEntries);
+            return LedgerLoadResult::Repaired;
+        }
+        return LedgerLoadResult::Valid;
+    };
 
-void Archipelago::PersistObservedItemLedger() const {
-    if (localSavePrefix_.empty()) return;
-    SaveLocalValue(localSavePrefix_ + ITEM_LEDGER_VERSION_VALUE, ITEM_LEDGER_VERSION);
-    SaveLocalValue(localSavePrefix_ + ITEM_LEDGER_OBSERVED_COUNT_VALUE,
-                   static_cast<int32_t>(observedItemIdsByIndex_.size()));
-    int32_t entry = 0;
-    for (const auto& [index, itemId] : observedItemIdsByIndex_) {
-        const std::string prefix = localSavePrefix_ + "ItemLedgerObserved" + std::to_string(entry++);
-        SaveLocalInt64(prefix + "Index", index);
-        SaveLocalInt64(prefix + "Item", itemId);
+    std::string error;
+    const auto currentResult = loadFromPrefix(localSavePrefix_, awardedItemCounts_, error);
+    if (currentResult == LedgerLoadResult::Valid) return true;
+    if (currentResult == LedgerLoadResult::Repaired) {
+        Logger::Log(LogLevel::File, "[AP] ", error, "; preserving valid unique entries:",
+                    awardedItemCounts_.size());
+        PersistAwardedItemCounts();
+        return true;
     }
+    if (currentResult == LedgerLoadResult::Invalid) {
+        lastError_ = error;
+        Logger::Log(LogLevel::File, "[AP] ", lastError_);
+        return false;
+    }
+
+    // Pre-release schema-1 builds included GetLastUsedSaveSlotIndex() in these keys. During new-save startup that
+    // value can still name the previously loaded slot, so recover the most complete ledger stored in this story save
+    // and immediately rewrite it under the stable seed/team/player prefix.
+    std::unordered_map<int64_t, std::uint32_t> recoveredCounts;
+    std::string recoveredPrefix;
+    std::uint64_t recoveredOccurrences = 0;
+    for (int32_t slot = 0; slot < LEGACY_SAVE_SLOT_SCAN_LIMIT; slot++) {
+        const std::string candidatePrefix = localSavePrefix_ + "Save" + std::to_string(slot) + "_";
+        std::unordered_map<int64_t, std::uint32_t> candidateCounts;
+        std::string candidateError;
+        if (loadFromPrefix(candidatePrefix, candidateCounts, candidateError) != LedgerLoadResult::Valid) continue;
+        const std::uint64_t candidateOccurrences = std::accumulate(
+            candidateCounts.begin(), candidateCounts.end(), std::uint64_t{0},
+            [](std::uint64_t total, const auto& entry) { return total + entry.second; });
+        if (recoveredPrefix.empty() || candidateOccurrences > recoveredOccurrences) {
+            recoveredCounts = std::move(candidateCounts);
+            recoveredPrefix = candidatePrefix;
+            recoveredOccurrences = candidateOccurrences;
+        }
+    }
+    if (!recoveredPrefix.empty()) {
+        awardedItemCounts_ = std::move(recoveredCounts);
+        PersistAwardedItemCounts();
+        Logger::Log(LogLevel::File, "[AP] Recovered mis-keyed schema-1 entitlement ledger; item types:",
+                    awardedItemCounts_.size(), "occurrences:", recoveredOccurrences, "old prefix:",
+                    recoveredPrefix, "new prefix:", localSavePrefix_);
+        return true;
+    }
+
+    if (LoadSavedValue(CONNECTION_SAVE_PREFIX + "Version")) {
+        lastError_ = "This save has no recoverable AP item ledger; refusing historical item replay";
+        Logger::Log(LogLevel::File, "[AP] ", lastError_, " prefix:", localSavePrefix_);
+        return false;
+    }
+
+    // A genuinely fresh story save must have a durable empty ledger before connection details are written. That
+    // distinction lets future loads fail closed instead of treating missing state as permission to replay history.
+    PersistAwardedItemCounts();
+    Logger::Log(LogLevel::File, "[AP] Initialized empty schema-1 entitlement ledger; prefix:", localSavePrefix_);
+    return true;
 }
 
 void Archipelago::PersistAwardedItemCounts() const {
     if (localSavePrefix_.empty()) return;
     std::vector<std::pair<int64_t, std::uint32_t>> counts(awardedItemCounts_.begin(), awardedItemCounts_.end());
     std::ranges::sort(counts);
-    SaveLocalValue(localSavePrefix_ + ITEM_LEDGER_VERSION_VALUE, ITEM_LEDGER_VERSION);
-    SaveLocalValue(localSavePrefix_ + ITEM_LEDGER_AWARDED_COUNT_VALUE, static_cast<int32_t>(counts.size()));
     int32_t entry = 0;
     for (const auto& [itemId, count] : counts) {
-        const std::string prefix = localSavePrefix_ + "ItemLedgerAwarded" + std::to_string(entry++);
+        const std::string prefix = localSavePrefix_ + "EntitlementLedger" + std::to_string(entry++);
         SaveLocalInt64(prefix + "Item", itemId);
         SaveLocalValue(prefix + "Count", static_cast<int32_t>(count));
     }
-}
-
-void Archipelago::UpdateObservedItemLedger() {
-    if (localSavePrefix_.empty()) return;
-    std::map<int64_t, int64_t> serverLedger;
-    for (const auto& [index, item] : receivedItems_) serverLedger.insert_or_assign(index, item.item);
-    if (serverLedger == observedItemIdsByIndex_) return;
-
-    for (const auto& [index, itemId] : serverLedger) {
-        const auto previous = observedItemIdsByIndex_.find(index);
-        if (previous != observedItemIdsByIndex_.end() && previous->second != itemId) {
-            Logger::Log(LogLevel::File, "[AP] Server item history changed at index:", index,
-                        "previous ID:", previous->second, "current ID:", itemId);
-        }
-    }
-    observedItemIdsByIndex_ = std::move(serverLedger);
-    itemLedgerLoaded_ = true;
-    loadedLedgerPrefix_ = localSavePrefix_;
-    PersistObservedItemLedger();
+    // Publish metadata last. If the game exits during an entry write, the previous smaller count remains a valid
+    // ledger and the partially written suffix is ignored instead of making the save impossible to reconnect.
+    SaveLocalValue(localSavePrefix_ + ENTITLEMENT_LEDGER_VERSION_VALUE, ENTITLEMENT_LEDGER_VERSION);
+    SaveLocalValue(localSavePrefix_ + ENTITLEMENT_LEDGER_COUNT_VALUE, static_cast<int32_t>(counts.size()));
 }
 
 void Archipelago::ProcessReceivedItems() {
@@ -639,12 +837,10 @@ void Archipelago::ProcessReceivedItems() {
     if (!ap || !GameManager::Instance().CanReceiveItems()) {
         return;
     }
-    TryMigrateLegacyProgress();
     if (!localProgressLoaded_) return;
 
-    // Repair acknowledged progression before newer deliveries. Otherwise one
-    // unresolved later item can indefinitely starve recovery of a required item
-    // such as Zangetsuto that an older client already committed as received.
+    // Repair ledger-acknowledged progression before newer deliveries. Otherwise
+    // an unresolved later item can indefinitely starve current-save recovery.
     ReconcileReceivedProgressionInventory();
     if (receivedItemGrantPending_ || !receivedProgressionInventoryReconciled_) {
         return;
@@ -662,22 +858,22 @@ void Archipelago::ProcessReceivedItems() {
 
     const auto& item = *itemToGrant;
     const int64_t itemIndex = item.index;
-    const auto nativeItemName = GetNativeItemName(item.item);
+    const auto progressiveItemName = bloodstained::items::ResolveProgressiveItem(
+        static_cast<std::uint64_t>(item.item), awardedItemCounts_[item.item]);
+    const auto nativeItemName = progressiveItemName ? progressiveItemName : GetNativeItemName(item.item);
     const std::string itemName = nativeItemName ? std::string(*nativeItemName) : std::string();
     const std::string displayItemName = GetDisplayItemName(item.item);
     const std::string savePrefix = localSavePrefix_;
     const uint64_t generation = receivedItemGeneration_;
     Logger::Log(LogLevel::File, "[AP] Attempting received item grant:", displayItemName, "ID:", item.item,
-                "index:", itemIndex, "committed index:", lastReceivedItemIndex_);
+                "index:", itemIndex, "awarded occurrences:", awardedItemCounts_[item.item]);
 
     receivedItemGrantPending_ = true;
-    lastQueuedItemIndex_ = itemIndex;
     if (!GivePlayerItem(itemName, false,
                         [this, itemIndex, itemId = item.item, itemName, savePrefix, generation](ItemGrantResult result) {
                             CompleteReceivedItem(itemIndex, itemId, itemName, savePrefix, generation, result);
                         })) {
         receivedItemGrantPending_ = false;
-        lastQueuedItemIndex_ = lastReceivedItemIndex_;
         receivedItemRetryAt_ = std::chrono::steady_clock::now() + ITEM_GRANT_RETRY_DELAY;
         Logger::Log(LogLevel::File, "[AP] Delaying unresolved received item:", itemName, "index:", itemIndex);
     }
@@ -691,7 +887,6 @@ void Archipelago::CompleteReceivedItem(int64_t itemIndex, int64_t itemId, const 
     }
 
     receivedItemGrantPending_ = false;
-    lastQueuedItemIndex_ = lastReceivedItemIndex_;
     if (localSavePrefix_ != savePrefix) {
         Logger::Log(LogLevel::File, "[AP] Discarding received item result after save or slot change:", itemName,
                     "index:", itemIndex);
@@ -706,59 +901,18 @@ void Archipelago::CompleteReceivedItem(int64_t itemIndex, int64_t itemId, const 
     }
 
     awardedItemCounts_[itemId]++;
-    itemLedgerLoaded_ = true;
-    loadedLedgerPrefix_ = localSavePrefix_;
     PersistAwardedItemCounts();
-    lastReceivedItemIndex_ = std::max(lastReceivedItemIndex_, itemIndex);
-    SaveLocalValue(savePrefix + ITEM_INDEX_SAVE_VALUE, static_cast<int32_t>(lastReceivedItemIndex_));
-    lastQueuedItemIndex_ = itemIndex;
+    InGameTracker::Instance().InvalidateReachability("AP received item committed");
     receivedItemRetryAt_ = std::chrono::steady_clock::now() + ITEM_GRANT_INTERVAL;
     if (result == ItemGrantResult::AtCapacity) {
         Logger::Log(LogLevel::File, "[AP] Received item already at native inventory capacity:", itemName,
                     "committed index:", itemIndex);
+    } else if (result == ItemGrantResult::Unsupported) {
+        Logger::Log(LogLevel::File, "[AP] Skipped received item unsupported by this game installation:", itemName,
+                    "committed index:", itemIndex);
     } else {
         Logger::Log(LogLevel::File, "[AP] Received item grant succeeded:", itemName, "committed index:", itemIndex);
     }
-}
-
-void Archipelago::TryMigrateLegacyProgress() {
-    if (!legacyReceivedItemIndex_ || receivedItems_.empty()) return;
-
-    bool hasPreviouslyReceivedInventory = false;
-    std::unordered_set<std::string> matchingItemIds;
-    for (const auto& [index, item] : receivedItems_) {
-        if (index > *legacyReceivedItemIndex_) continue;
-        const auto nativeItemName = GetNativeItemName(item.item);
-        if (!nativeItemName) continue;
-        const std::string itemName(*nativeItemName);
-        const auto itemId = GameManager::Instance().GetIdFromDisplayName(itemName);
-        if (itemId && GameManager::Instance().CheckAllInventories(*itemId)) {
-            matchingItemIds.insert(*itemId);
-            const bool isShard = IsShardOrSkillItem(*itemId);
-            if (isShard || matchingItemIds.size() >= 3) {
-                hasPreviouslyReceivedInventory = true;
-                break;
-            }
-        }
-    }
-
-    lastReceivedItemIndex_ = hasPreviouslyReceivedInventory ? *legacyReceivedItemIndex_ : -1;
-    lastQueuedItemIndex_ = lastReceivedItemIndex_;
-    if (hasPreviouslyReceivedInventory) {
-        for (const auto& [index, item] : receivedItems_) {
-            if (index > *legacyReceivedItemIndex_) break;
-            awardedItemCounts_[item.item]++;
-        }
-    }
-    itemLedgerLoaded_ = true;
-    loadedLedgerPrefix_ = localSavePrefix_;
-    UpdateObservedItemLedger();
-    PersistAwardedItemCounts();
-    SaveLocalValue(localSavePrefix_ + ITEM_INDEX_SAVE_VALUE, static_cast<int32_t>(lastReceivedItemIndex_));
-    Logger::Log("[AP]", hasPreviouslyReceivedInventory ? "Migrated legacy item index:" : "Ignored legacy item index:",
-                *legacyReceivedItemIndex_, "loaded index:", lastReceivedItemIndex_);
-    legacyReceivedItemIndex_.reset();
-    localProgressLoaded_ = true;
 }
 
 void Archipelago::ReconcileReceivedProgressionInventory() {
@@ -774,6 +928,12 @@ void Archipelago::ReconcileReceivedProgressionInventory() {
         const auto nativeItemName = GetNativeItemName(item.item);
         if (!nativeItemName) continue;
         std::string itemName(*nativeItemName);
+        const auto dlcOwnership = GameManager::Instance().GetPaidDlcItemOwnership(itemName);
+        if (dlcOwnership == DlcOwnership::NotOwned) continue;
+        if (dlcOwnership == DlcOwnership::NotReady) {
+            receivedItemRetryAt_ = std::chrono::steady_clock::now() + ITEM_GRANT_RETRY_DELAY;
+            return;
+        }
         const auto itemId = GameManager::Instance().GetIdFromDisplayName(itemName);
         if (!itemId) continue;
 
@@ -805,8 +965,14 @@ void Archipelago::ReconcileReceivedProgressionInventory() {
                     return;
                 }
                 receivedItemRetryAt_ = std::chrono::steady_clock::now() + ITEM_GRANT_INTERVAL;
-                Logger::Log(LogLevel::File, "[AP] Missing progression item or shard repair succeeded:",
-                            itemName, "index:", index);
+                if (result == ItemGrantResult::Unsupported) {
+                    Logger::Log(LogLevel::File,
+                                "[AP] Skipped missing progression repair unsupported by this game installation:",
+                                itemName, "index:", index);
+                } else {
+                    Logger::Log(LogLevel::File, "[AP] Missing progression item or shard repair succeeded:",
+                                itemName, "index:", index);
+                }
             });
         return;
     }
@@ -844,7 +1010,7 @@ void Archipelago::BaelDefeated() {
 
 void Archipelago::InvokeDeathLink() {
     if (!ap) return;
-    if (!wantsDeathlink_) return;
+    if (deathLinkMode_ == DeathLinkMode::Off) return;
     deathtime = ap->get_server_time();
     int causeOfDeathNum = std::rand() % deathReasons_.size();
     std::list<std::string>::iterator it = deathReasons_.begin();
@@ -856,6 +1022,27 @@ void Archipelago::InvokeDeathLink() {
     };
     ap->Bounce(data, {}, {}, {"DeathLink"});
     ap->poll();
+}
+
+void Archipelago::SetDeathLinkMode(DeathLinkMode deathLinkMode) {
+    if (deathLinkMode < DeathLinkMode::Off || deathLinkMode > DeathLinkMode::GameOver) return;
+    if (deathLinkMode_ == deathLinkMode) return;
+
+    const bool wasEnabled = deathLinkMode_ != DeathLinkMode::Off;
+    const bool isEnabled = deathLinkMode != DeathLinkMode::Off;
+    deathLinkMode_ = deathLinkMode;
+    if (!isEnabled) pendingDeathlink_ = false;
+
+    if (ap && wasEnabled != isEnabled) {
+        std::list<std::string> tags;
+        if (isEnabled) tags.push_back("DeathLink");
+        const bool updated = ap->ConnectUpdate(false, itemsHandling_, true, tags);
+        Logger::Log(LogLevel::File, "[AP] Updated DeathLink server tag; enabled:", isEnabled,
+                    "accepted:", updated);
+    }
+
+    Logger::Log(LogLevel::File, "[AP] DeathLink consequence mode:", static_cast<int32_t>(deathLinkMode_));
+    if (state_ == ArchipelagoConnectionState::SlotConnected) SaveConnectionInfo();
 }
 
 bool Archipelago::GivePlayerItem(const std::string& itemName, bool shouldDisplay,
@@ -905,46 +1092,46 @@ bool Archipelago::GivePlayerItem(const std::string& itemName, bool shouldDisplay
     }
 }
 
-bool Archipelago::Connect(const std::string& slotName, const std::string& password, const std::string uri = "",
-                          const bool& wantsDeathlink = false) {
+bool Archipelago::Connect(const std::string& slotName, const std::string& password, const std::string uri,
+                          DeathLinkMode deathLinkMode) {
     if (!GameManager::Instance().IsPlayerLoadedInGame()) {
         Logger::Log("Player is not loaded in game");
+        return false;
+    }
+    if (!MainMenuStatus::Instance().IsStaticPakReady()) {
+        lastError_ = "BloodstainedAP.pak 1.1.0 is missing, invalid, or conflicts with Randomizer.pak";
+        Logger::Log(LogLevel::Error, "[AP] ", lastError_);
         return false;
     }
 
     slotName_ = slotName;
     password_ = password;
-    std::string normalizedUri = uri;
-    if (normalizedUri.starts_with("ws://")) normalizedUri.erase(0, 5);
-    if (normalizedUri.starts_with("wss://")) normalizedUri.erase(0, 6);
-    currentUri_ = normalizedUri;
-    wantsDeathlink_ = wantsDeathlink;
+    const std::string serverUri = bloodstained::connection::PrepareServerUri(uri, APClient::DEFAULT_URI);
+    currentUri_ = serverUri;
+    deathLinkMode_ = deathLinkMode;
     Logger::Log(LogLevel::File, "[AP] Connecting slot:", slotName_, "server:",
-                normalizedUri.empty() ? APClient::DEFAULT_URI : normalizedUri);
+                serverUri);
     ResetLocalLocationCache();
     localSavePrefix_.clear();
+    slotData_ = json{};
+    worldLocationSnapshotReady_ = false;
     localProgressLoaded_ = false;
-    itemLedgerLoaded_ = false;
-    lastReceivedItemIndex_ = -1;
-    lastQueuedItemIndex_ = -1;
     receivedItemGrantPending_ = false;
     receivedItemRetryAt_ = {};
     receivedItemGeneration_++;
-    pendingReceivedItems_.clear();
     receivedItems_.clear();
     receivedProgressionInventoryReconciled_ = false;
-    HookManager::ResetCompatibilityShardMasterData();
+    HookManager::ResetShardDropPolicy();
     InGameTracker::Instance().ResetConnection();
 
-    Logger::Log(LogLevel::Debug, "[AP]", "Connecting Player: ", slotName_, "with uri: ", normalizedUri);
+    Logger::Log(LogLevel::Debug, "[AP]", "Connecting Player: ", slotName_, "with uri: ", serverUri);
     UpdateState(ArchipelagoConnectionState::Connecting);
 
     ap.reset();
-    std::string uri_without_scheme = normalizedUri.empty() ? APClient::DEFAULT_URI : normalizedUri;
+    const std::string uuidHost(bloodstained::connection::RemoveWebSocketScheme(serverUri));
+    std::string uuid = ap_get_uuid(UUID_FILE, uuidHost);
 
-    std::string uuid = ap_get_uuid(UUID_FILE, uri_without_scheme);
-
-    ap.reset(new APClient(uuid, GAME_NAME, normalizedUri.empty() ? APClient::DEFAULT_URI : normalizedUri, CERT_STORE));
+    ap.reset(new APClient(uuid, GAME_NAME, serverUri, CERT_STORE));
     game_seed = ap->get_seed();
 
     ap_slot_connect_sent = false;
@@ -1001,7 +1188,6 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
                                        (item.flags & APClient::ItemFlags::FLAG_ADVANCEMENT) != 0;
             progressionChanged |= isProgression;
         }
-        UpdateObservedItemLedger();
         if (progressionChanged) {
             // ReceivedItems can be delivered in multiple batches. A previous
             // batch may have completed reconciliation before this progression
@@ -1031,7 +1217,7 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
         Logger::Log("[AP] Data package loaded for game: ", GAME_NAME);
         ProcessReceivedItems();
         SendMissingClearedLocations();
-        HookManager::ApplyCompatibilityShardMasterData();
+        HookManager::ApplyShardDropPolicy();
     });
 
     ap->set_slot_connected_handler([this](const json& slotData) {
@@ -1041,16 +1227,19 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
         Logger::Log(slotData.dump());
 
         slotData_ = slotData;
-        auto* saveManager = SDK::UPBSaveManager::GetInstance();
-        const int32_t saveSlotIndex = saveManager ? saveManager->GetLastUsedSaveSlotIndex() : -1;
         localSavePrefix_ = "AP_" + ap->get_seed() + "_" + std::to_string(ap->get_team_number()) + "_" +
-                           std::to_string(ap->get_player_number()) + "_Save" + std::to_string(saveSlotIndex) + "_";
-        LoadLocalProgress();
-        UpdateObservedItemLedger();
+                           std::to_string(ap->get_player_number()) + "_";
+        if (!ValidateRequiredDlcLocations() || !ValidateSlotAndSave(slotData) || !LoadLocalProgress()) {
+            Logger::Log(LogLevel::File, "[AP] Rejecting slot for active save:", lastError_);
+            GameManager::Instance().SendInGameNotification(lastError_, 1023);
+            UpdateState(ArchipelagoConnectionState::InvalidSlotError);
+            return;
+        }
+        worldLocationSnapshotReady_ = true;
         UpdateState(ArchipelagoConnectionState::SlotConnected);
         SendMissingClearedLocations();
         ReconcileCompletedBossShardLocations();
-        HookManager::ApplyCompatibilityShardMasterData();
+        HookManager::ApplyShardDropPolicy();
         SaveConnectionInfo();
 
         if (!ApplyConnectedEnemyDropShuffle(ap->get_seed(),
@@ -1094,7 +1283,7 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
         Logger::Log(LogLevel::File, "[AP] Socket disconnected; automatic reconnect pending for:", slotName_);
         Logger::Log(LogLevel::Debug, "[AP]", "socket disconnected");
         AbortPassword();
-        HookManager::ResetCompatibilityShardMasterData();
+        HookManager::ApplyShardDropPolicy();
         ap_slot_connect_sent = false;
         UpdateState(ArchipelagoConnectionState::Disconnected);
     });
@@ -1102,7 +1291,7 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
     ap->set_slot_disconnected_handler([this]() {
         Logger::Log(LogLevel::File, "[AP] Slot disconnected:", slotName_);
         Logger::Log(LogLevel::Debug, "[AP]", "Player: ", slotName_, "disconnected");
-        HookManager::ResetCompatibilityShardMasterData();
+        HookManager::ApplyShardDropPolicy();
         UpdateState(ArchipelagoConnectionState::Disconnected);
         ap_slot_connect_sent = false;
     });
@@ -1125,28 +1314,33 @@ bool Archipelago::Connect(const std::string& slotName, const std::string& passwo
     });
 
     ap->set_bounced_handler([this, slotName](const json& cmd) {
-        if (wantsDeathlink_) {
-            Logger::Log("Recieved DeathLink");
-            auto tagsIt = cmd.find("tags");
-            auto dataIt = cmd.find("data");
-            if (tagsIt != cmd.end() && tagsIt->is_array() &&
-                std::find(tagsIt->begin(), tagsIt->end(), "DeathLink") != tagsIt->end()) {
-                if (dataIt != cmd.end() && dataIt->is_object()) {
-                    json data = *dataIt;
-                    if (data["source"].get<std::string>() != slotName) {
-                        std::string source =
-                            data["source"].is_string() ? data["source"].get<std::string>().c_str() : "???";
-                        std::string cause =
-                            data["cause"].is_string() ? data["cause"].get<std::string>().c_str() : "???";
-                        GameManager::Instance().SendInGameNotification(source + ": " + cause, 346);  // 346 for skull id
-                        Logger::Log("Died by the hands of " + source + " : " + cause);
-                        pendingDeathlink_ = true;
-                    }
-                } else {
-                    Logger::Log("Bad deathlink packet!");
-                }
-            }
+        if (deathLinkMode_ == DeathLinkMode::Off) return;
+
+        const auto tagsIt = cmd.find("tags");
+        if (tagsIt == cmd.end() || !tagsIt->is_array() ||
+            std::find(tagsIt->begin(), tagsIt->end(), "DeathLink") == tagsIt->end()) {
+            return;
         }
+
+        const auto dataIt = cmd.find("data");
+        if (dataIt == cmd.end() || !dataIt->is_object()) {
+            Logger::Log(LogLevel::File, "[AP] Ignored malformed DeathLink packet");
+            return;
+        }
+
+        const auto sourceIt = dataIt->find("source");
+        const auto causeIt = dataIt->find("cause");
+        const std::string source = sourceIt != dataIt->end() && sourceIt->is_string()
+                                       ? sourceIt->get<std::string>()
+                                       : "???";
+        if (source == slotName) return;
+
+        const std::string cause = causeIt != dataIt->end() && causeIt->is_string()
+                                      ? causeIt->get<std::string>()
+                                      : "???";
+        GameManager::Instance().SendInGameNotification(source + ": " + cause, 346);
+        Logger::Log(LogLevel::File, "[AP] Received DeathLink from:", source, "cause:", cause);
+        pendingDeathlink_ = true;
     });
 
     return true;
@@ -1156,19 +1350,19 @@ void Archipelago::AbortPassword() { awaiting_password = false; }
 
 void Archipelago::Disconnect() {
     Logger::Log(LogLevel::File, "[AP] Manual disconnect:", slotName_);
-    HookManager::ResetCompatibilityShardMasterData();
+    HookManager::ResetShardDropPolicy();
     UpdateState(ArchipelagoConnectionState::Disconnected);
     ap.reset();
     ap_slot_connect_sent = false;
-    pendingReceivedItems_.clear();
     receivedItems_.clear();
     receivedItemGrantPending_ = false;
     receivedItemRetryAt_ = {};
     receivedItemGeneration_++;
     localSavePrefix_.clear();
     localProgressLoaded_ = false;
-    legacyReceivedItemIndex_.reset();
     receivedProgressionInventoryReconciled_ = false;
+    slotData_ = json{};
+    worldLocationSnapshotReady_ = false;
     InGameTracker::Instance().ResetConnection();
 }
 
@@ -1192,11 +1386,19 @@ void Archipelago::Poll() {
         ~PollGuard() { flag.clear(); }
     } pollGuard{polling_};
 
-    if (ap) ap->poll();
-    if (state_ == ArchipelagoConnectionState::Connected && !ap_slot_connect_sent) {
-        ConnectSlot();
+    try {
+        if (ap) ap->poll();
+        if (state_ == ArchipelagoConnectionState::Connected && !ap_slot_connect_sent) {
+            ConnectSlot();
+        }
+        ProcessReceivedItems();
+    } catch (const std::exception& exception) {
+        Logger::Log(LogLevel::File, "[AP] Network poll failed; disconnecting safely:", exception.what());
+        Disconnect();
+    } catch (...) {
+        Logger::Log(LogLevel::File, "[AP] Network poll failed with an unknown exception; disconnecting safely");
+        Disconnect();
     }
-    ProcessReceivedItems();
 }
 
 void Archipelago::UpdateState(ArchipelagoConnectionState newState) {
