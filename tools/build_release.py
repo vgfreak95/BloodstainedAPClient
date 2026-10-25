@@ -1,9 +1,12 @@
-"""Build the single-root Bloodstained AP distribution bundle."""
+"""Build the single-root Bloodstained AP distribution bundle.
+
+The release version comes from the repository's version.toml and the pinned static pak
+from release/static_pak_manifest.json (see release_info.py and RELEASING.md).
+"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import subprocess
@@ -13,16 +16,19 @@ import textwrap
 import zipfile
 from pathlib import Path
 
-
-VERSION = "1.1.0"
-ROOT_NAME = f"BloodstainedAP-{VERSION}"
-EXPECTED_PAK_SHA256 = "a99933b03da0b93ced56facb8ef5f86758e4b08180453cad9fe66f9c33950dda"
-EXPECTED_PAK_FILES = 784
-FORBIDDEN_GENERATED_ASSETS = (
-    "/difficultselecter.",
-    "/entrynamesetter.",
-    "/versionnumber.",
+from build_config import apply_config
+from release_info import (
+    GENERATED_ASSET_STEMS,
+    PAK_MANIFEST,
+    ReleaseInfo,
+    load_pak_manifest,
+    load_pak_pin,
+    load_version,
+    sha256,
 )
+
+
+FORBIDDEN_GENERATED_ASSETS = tuple(f"/{stem.lower()}." for stem in GENERATED_ASSET_STEMS)
 PAID_DLC_PATH_MARKERS = (
     "/dlc_0002/",
     "/classic2",
@@ -34,24 +40,22 @@ PAID_DLC_PATH_MARKERS = (
 APWORLD_EXCLUDED_TOP_LEVEL = {"data", "generated", "generators", "test"}
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def validate_pak(pak: Path, repak: Path) -> None:
+    pin = load_pak_pin()
     actual_hash = sha256(pak)
-    if actual_hash != EXPECTED_PAK_SHA256:
-        raise ValueError(f"static pak hash mismatch: {actual_hash}")
+    if actual_hash != pin.sha256:
+        raise ValueError(
+            f"static pak hash {actual_hash} does not match the pin in {PAK_MANIFEST}; "
+            "pin a reviewed pak with build_static_pak.py --pin (see RELEASING.md)"
+        )
     listing = subprocess.run(
         [str(repak), "list", str(pak)], check=True, capture_output=True, text=True
     ).stdout.splitlines()
     paths = [path.strip() for path in listing if path.strip()]
-    if len(paths) != EXPECTED_PAK_FILES:
-        raise ValueError(f"static pak contains {len(paths)} files, expected {EXPECTED_PAK_FILES}")
+    if len(paths) != pin.file_count:
+        raise ValueError(
+            f"static pak contains {len(paths)} files, {PAK_MANIFEST} pins {pin.file_count}"
+        )
     for path in paths:
         normalized = "/" + path.replace("\\", "/").lower()
         generated_asset = next(
@@ -64,7 +68,17 @@ def validate_pak(pak: Path, repak: Path) -> None:
             raise ValueError(f"paid-DLC path {path!r} matched forbidden marker {marker!r}")
 
 
-def validate_apworld(apworld: Path, archipelago_root: Path, python_executable: Path) -> None:
+def validate_asi(asi: Path, info: ReleaseInfo) -> None:
+    # ClientVersion::Display is embedded verbatim; a stale ASI lacks the new version.
+    if f"{info.version}\0".encode() not in asi.read_bytes():
+        raise ValueError(
+            f"{asi} does not contain client version {info.version}; rebuild it with build_mod.py"
+        )
+
+
+def validate_apworld(
+    apworld: Path, archipelago_root: Path, python_executable: Path, info: ReleaseInfo
+) -> None:
     with zipfile.ZipFile(apworld) as archive:
         manifest_name = next(
             (name for name in archive.namelist() if name.endswith("/archipelago.json")), None
@@ -72,10 +86,12 @@ def validate_apworld(apworld: Path, archipelago_root: Path, python_executable: P
         if not manifest_name:
             raise ValueError("APWorld has no archipelago.json")
         manifest = json.loads(archive.read(manifest_name))
-    if manifest.get("world_version") != VERSION:
-        raise ValueError(f"APWorld version is {manifest.get('world_version')!r}, expected {VERSION}")
-    if manifest.get("minimum_ap_version") != "0.6.7":
-        raise ValueError("APWorld does not require Archipelago 0.6.7")
+    if manifest.get("world_version") != info.version:
+        raise ValueError(
+            f"APWorld version is {manifest.get('world_version')!r}, expected {info.version}"
+        )
+    if manifest.get("minimum_ap_version") != info.min_ap_version:
+        raise ValueError(f"APWorld does not require Archipelago {info.min_ap_version}")
 
     probe = textwrap.dedent(
         """
@@ -160,14 +176,33 @@ def main() -> None:
         default=repository.parents[1] / "randomizer/True-Randomization/LICENSE",
         help="License for the True Randomizer-derived static pak",
     )
+    parser.add_argument(
+        "--asi-loader-license",
+        type=Path,
+        default=repository.parents[1] / "tools/Ultimate-ASI-Loader-source/license",
+        help="License for the Ultimate ASI Loader",
+    )
     apworld_source = parser.add_mutually_exclusive_group(required=True)
     apworld_source.add_argument("--apworld", type=Path)
     apworld_source.add_argument("--world-source", type=Path, help="Loose worlds/bloodstained_rotn directory")
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Bundle .zip path, or a directory to receive BloodstainedAP-<version>[-<label>].zip",
+    )
     parser.add_argument("--package-label", help="Test-package label recorded in README and manifest")
+    apply_config(parser, "release")
     args = parser.parse_args()
 
-    for path in (args.asi, args.pak, args.repak, args.loader, args.true_randomizer_license):
+    for path in (
+        args.asi,
+        args.pak,
+        args.repak,
+        args.loader,
+        args.asi_loader_license,
+        args.true_randomizer_license,
+    ):
         if not path.is_file():
             raise FileNotFoundError(path)
     if not args.archipelago_root.joinpath("worlds", "AutoWorld.py").is_file():
@@ -177,7 +212,12 @@ def main() -> None:
         args.archipelago_python = venv_python if venv_python.is_file() else Path(sys.executable)
     if not args.archipelago_python.is_file():
         raise FileNotFoundError(args.archipelago_python)
+    info = load_version()
+    root_name = f"BloodstainedAP-{info.version}"
+    package_name = f"{root_name}-{args.package_label}" if args.package_label else root_name
+    output = args.output if args.output.suffix == ".zip" else args.output / f"{package_name}.zip"
     validate_pak(args.pak, args.repak)
+    validate_asi(args.asi, info)
 
     with tempfile.TemporaryDirectory(prefix="bloodstained-ap-release-") as temporary:
         temporary_path = Path(temporary)
@@ -190,9 +230,9 @@ def main() -> None:
             if not args.apworld.is_file():
                 raise FileNotFoundError(args.apworld)
             apworld_path = args.apworld
-        validate_apworld(apworld_path, args.archipelago_root, args.archipelago_python)
+        validate_apworld(apworld_path, args.archipelago_root, args.archipelago_python, info)
 
-        root = Path(temporary) / ROOT_NAME
+        root = Path(temporary) / root_name
         game_binary = root / "Game/BloodstainedRotN/Binaries/Win64"
         mod_paks = root / "Game/BloodstainedRotN/Content/Paks/~mods"
         archipelago = root / "Archipelago"
@@ -203,25 +243,24 @@ def main() -> None:
         shutil.copy2(args.loader, game_binary / "winhttp.dll")
         shutil.copy2(args.pak, mod_paks / "BloodstainedAP.pak")
         shutil.copy2(apworld_path, archipelago / "bloodstained_rotn.apworld")
-        readme = repository.joinpath("release/README.txt").read_text(encoding="utf-8")
-        if args.package_label:
-            readme = readme.replace(
-                "Bloodstained Archipelago 1.1.0",
-                f"Bloodstained Archipelago 1.1.0 {args.package_label} package",
-                1,
-            )
+        readme = repository.joinpath("release/README.txt").read_text(encoding="utf-8").format(
+            version=info.version,
+            min_ap_version=info.min_ap_version,
+            package_suffix=f" {args.package_label} package" if args.package_label else "",
+        )
         root.joinpath("README.txt").write_text(readme, encoding="utf-8")
-        shutil.copy2(repository / "release/static_pak_manifest.json", root / "static_pak_manifest.json")
+        pak_manifest = {"package_version": info.version, **load_pak_manifest()}
+        root.joinpath("static_pak_manifest.json").write_text(
+            json.dumps(pak_manifest, indent=2) + "\n", encoding="utf-8"
+        )
         shutil.copy2(repository / "LICENSE.txt", root / "LICENSE-BloodstainedAPClient.txt")
-        loader_license = repository.parents[1] / "tools/Ultimate-ASI-Loader-source/license"
-        shutil.copy2(loader_license, root / "LICENSE-Ultimate-ASI-Loader.txt")
+        shutil.copy2(args.asi_loader_license, root / "LICENSE-Ultimate-ASI-Loader.txt")
         shutil.copy2(args.true_randomizer_license, root / "LICENSE-True-Randomizer.txt")
 
-        package_name = f"{ROOT_NAME}-{args.package_label}" if args.package_label else ROOT_NAME
         manifest = {
             "package": package_name,
-            "client_world_version": VERSION,
-            "required_archipelago_version": "0.6.7",
+            "client_world_version": info.version,
+            "required_archipelago_version": info.min_ap_version,
             "test_build": bool(args.package_label),
             "files": {
                 "Game/BloodstainedRotN/Binaries/Win64/plugins/BloodstainedAP.asi": sha256(
@@ -239,10 +278,10 @@ def main() -> None:
             },
         }
         root.joinpath("manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        write_deterministic_zip(root, args.output)
+        write_deterministic_zip(root, output)
 
-    print(f"Built {args.output}")
-    print(f"SHA-256: {sha256(args.output)}")
+    print(f"Built {output}")
+    print(f"SHA-256: {sha256(output)}")
 
 
 if __name__ == "__main__":

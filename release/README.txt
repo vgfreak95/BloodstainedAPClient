@@ -1,10 +1,10 @@
-Bloodstained Archipelago 1.1.0
+Bloodstained Archipelago {version}{package_suffix}
 ================================
 
 Requirements
 ------------
 - Bloodstained: Ritual of the Night on Windows
-- Archipelago 0.6.7 or newer
+- Archipelago {min_ap_version} or newer
 - A NEW story save. Saves used by Bloodstained AP before 1.1.0 are intentionally rejected.
 
 Game installation
@@ -21,8 +21,8 @@ Install Archipelago\bloodstained_rotn.apworld with Archipelago's "Install APWorl
 
 Compatibility and content policy
 --------------------------------
-- Client/world version: 1.1.0
-- Required Archipelago version: 0.6.7
+- Client/world version: {version}
+- Required Archipelago version: {min_ap_version}
 - Static pak/save schema: 1
 - Normal, Hard, and Nightmare slots are supported; the story save difficulty must match the slot.
 - Paid DLC is excluded. Free update content is included even when the game data marks it as DLC.

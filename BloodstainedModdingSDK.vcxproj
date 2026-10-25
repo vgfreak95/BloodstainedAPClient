@@ -44,7 +44,7 @@
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
-    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
+    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
@@ -52,7 +52,7 @@
     <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
-    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
+    <LocalDebuggerEnvironment>BS_GAME_PATH=C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64;%PATH%</LocalDebuggerEnvironment>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -126,6 +126,7 @@
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <ForceSynchronousPDBWrites>true</ForceSynchronousPDBWrites>
+      <DebugInformationFormat>None</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -231,6 +232,7 @@
     <ClInclude Include="Mod\IToggleMod.h" />
     <ClInclude Include="Mod\Logger.h" />
     <ClInclude Include="Mod\ClientVersion.h" />
+    <ClInclude Include="Mod\StaticPakPin.h" />
     <ClInclude Include="Mod\ConnectionUri.h" />
     <ClInclude Include="Mod\EnemyDropData.generated.h" />
     <ClInclude Include="Mod\EnemyDropShuffle.h" />

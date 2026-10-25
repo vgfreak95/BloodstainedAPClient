@@ -29,6 +29,7 @@ Example from the workspace root:
   --ue4-dds-tools-dir "D:\Bloodstained\randomizer\True-Randomization-Release\Tools\UE4DDSTools"
 ```
 
-After regeneration, update the pinned SHA-256 together in
-`release/static_pak_manifest.json`, `tools/build_release.py`, and
-`Mod/MainMenuStatus.cpp`, then clean-build the ASI so its runtime pak check matches.
+After regeneration, update the pinned SHA-256 together, then clean-build the ASI so its runtime pak check matches.
+1. `release/static_pak_manifest.json`
+2. tools/build_release.py`
+3. `Mod/MainMenuStatus.cpp`

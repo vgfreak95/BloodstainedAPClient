@@ -13,6 +13,7 @@
 #include "ClientVersion.h"
 #include "Logger.h"
 #include "ProjectBlood_classes.hpp"
+#include "StaticPakPin.h"
 #include "UMG_classes.hpp"
 #include "Utils.h"
 #include "VersionNumber_classes.hpp"
@@ -20,8 +21,6 @@
 namespace {
 
 constexpr unsigned long long STATUS_REFRESH_INTERVAL_MS = 1000;
-constexpr std::string_view STATIC_PAK_SHA256 =
-    "a99933b03da0b93ced56facb8ef5f86758e4b08180453cad9fe66f9c33950dda";
 
 bool IsOwnedBy(const SDK::UObject* object, const SDK::UObject* owner) {
     for (const SDK::UObject* outer = object ? object->Outer : nullptr; outer; outer = outer->Outer) {

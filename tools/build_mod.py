@@ -1,30 +1,34 @@
-"""Build and install the Bloodstained AP client."""
+"""Build and install the Bloodstained AP client.
+
+Before building, Mod/ClientVersion.h and Mod/StaticPakPin.h are regenerated from
+version.toml and release/static_pak_manifest.json (see release_info.py). Machine-specific
+defaults such as --game-dir belong in build_config.toml.
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from build_config import apply_config
+from release_info import REPOSITORY, sha256, sync_generated_headers
 
-REPOSITORY = Path(__file__).resolve().parents[1]
+
 PROJECT = REPOSITORY / "BloodstainedModdingSDK.vcxproj"
 ARTIFACT = REPOSITORY / "x64/Release/BloodstainedAP.asi"
-MSBUILD = Path(
-    r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
-    r"\MSBuild\Current\Bin\MSBuild.exe"
-)
 GAME_PROCESS = "BloodstainedRotN-Win64-Shipping.exe"
+# Fallbacks for a machine without build_config.toml.
 GAME_DIRECTORY = Path(
     r"C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night"
     r"\BloodstainedRotN\Binaries\Win64"
 )
-INSTALLED_PLUGIN = GAME_DIRECTORY / "plugins/BloodstainedAP.asi"
+DEFAULT_JOBS = 16
+PLUGIN_RELATIVE_PATH = Path("plugins/BloodstainedAP.asi")
 
 
 def positive_integer(value: str) -> int:
@@ -46,10 +50,42 @@ def sanitized_environment(jobs: int) -> dict[str, str]:
             continue
         seen.add(folded)
         environment[key] = value
-    environment["USERNAME"] = "fabia"
     environment["CL_MP"] = "true"
     environment["CL_MPCount"] = str(jobs)
     return environment
+
+
+def find_msbuild() -> Path | None:
+    """Locate MSBuild.exe via MSBUILD env var, vswhere, then PATH."""
+    override = os.environ.get("MSBUILD")
+    if override and Path(override).is_file():
+        return Path(override)
+
+    program_files = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles")
+    if program_files:
+        vswhere = Path(program_files) / "Microsoft Visual Studio/Installer/vswhere.exe"
+        if vswhere.is_file():
+            result = subprocess.run(
+                [
+                    str(vswhere),
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.Component.MSBuild",
+                    "-find",
+                    r"MSBuild\**\Bin\MSBuild.exe",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            for line in result.stdout.splitlines():
+                if line.strip() and Path(line.strip()).is_file():
+                    return Path(line.strip())
+
+    on_path = shutil.which("MSBuild")
+    return Path(on_path) if on_path else None
 
 
 def game_is_running() -> bool:
@@ -67,21 +103,13 @@ def game_is_running() -> bool:
     return False
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def install() -> str:
+def install(installed_plugin: Path) -> str:
     if not ARTIFACT.is_file():
         raise FileNotFoundError(f"build succeeded without producing {ARTIFACT}")
-    INSTALLED_PLUGIN.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ARTIFACT, INSTALLED_PLUGIN)
+    installed_plugin.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ARTIFACT, installed_plugin)
     artifact_hash = sha256(ARTIFACT)
-    installed_hash = sha256(INSTALLED_PLUGIN)
+    installed_hash = sha256(installed_plugin)
     if artifact_hash != installed_hash:
         raise RuntimeError(
             f"installed plugin hash mismatch: {installed_hash} != {artifact_hash}"
@@ -89,16 +117,19 @@ def install() -> str:
     return artifact_hash
 
 
-def run_msbuild(target: str, jobs: int) -> subprocess.CompletedProcess[str]:
+def run_msbuild(
+    msbuild: Path, target: str, jobs: int, toolset: str | None
+) -> subprocess.CompletedProcess[str]:
     command = [
-        str(MSBUILD),
+        str(msbuild),
         str(PROJECT),
         f"/t:{target}",
         "/p:Configuration=Release",
         "/p:Platform=x64",
-        "/p:PlatformToolset=v145",
         f"/m:{jobs}",
     ]
+    if toolset:
+        command.append(f"/p:PlatformToolset={toolset}")
     print(f"Running {target} with {jobs} compiler workers", flush=True)
     return subprocess.run(
         command,
@@ -119,15 +150,15 @@ def log_build_result(target: str, result: subprocess.CompletedProcess[str]) -> N
         print(f"{target} failed with exit code {result.returncode}.", file=sys.stderr, flush=True)
 
 
-def build(clean: bool, jobs: int) -> int:
+def build(msbuild: Path, clean: bool, jobs: int, toolset: str | None) -> int:
     target = "Rebuild" if clean else "Build"
-    result = run_msbuild(target, jobs)
+    result = run_msbuild(msbuild, target, jobs, toolset)
     log_build_result(target, result)
     if result.returncode == 0 or clean:
         return result.returncode
 
     print("Incremental build failed; retrying with a clean rebuild.", file=sys.stderr, flush=True)
-    result = run_msbuild("Rebuild", jobs)
+    result = run_msbuild(msbuild, "Rebuild", jobs, toolset)
     log_build_result("Rebuild", result)
     return result.returncode
 
@@ -142,25 +173,45 @@ def main() -> int:
     parser.add_argument(
         "--jobs",
         type=positive_integer,
-        default=16,
+        default=DEFAULT_JOBS,
         metavar="N",
-        help="maximum MSBuild and compiler workers (default: 16)",
+        help="maximum MSBuild and compiler workers (default: %(default)s)",
     )
+    parser.add_argument(
+        "--toolset",
+        metavar="NAME",
+        help="override the project's PlatformToolset, e.g. v145 (default: use the .vcxproj)",
+    )
+    parser.add_argument(
+        "--game-dir",
+        type=Path,
+        default=GAME_DIRECTORY,
+        metavar="PATH",
+        help="game Win64 binaries directory to install into (default: %(default)s)",
+    )
+    apply_config(parser, "mod")
     args = parser.parse_args()
+    game_directory: Path = args.game_dir
 
     if game_is_running():
         parser.error(f"{GAME_PROCESS} is running; exit the game before building")
-    if not MSBUILD.is_file():
-        parser.error(f"MSBuild was not found at {MSBUILD}")
-    if not GAME_DIRECTORY.is_dir():
-        parser.error(f"game directory was not found at {GAME_DIRECTORY}")
+    msbuild = find_msbuild()
+    if msbuild is None:
+        parser.error(
+            "MSBuild was not found (checked MSBUILD env var, vswhere, and PATH)"
+        )
+    if not game_directory.is_dir():
+        parser.error(f"game directory was not found at {game_directory}")
 
-    build_result = build(args.clean, args.jobs)
+    for header in sync_generated_headers():
+        print(f"Regenerated {header.relative_to(REPOSITORY)}")
+    build_result = build(msbuild, args.clean, args.jobs, args.toolset)
     if build_result != 0:
         return build_result
 
-    installed_hash = install()
-    print(f"Installed: {INSTALLED_PLUGIN}")
+    installed_plugin = game_directory / PLUGIN_RELATIVE_PATH
+    installed_hash = install(installed_plugin)
+    print(f"Installed: {installed_plugin}")
     print(f"SHA-256: {installed_hash}")
     return 0
 
