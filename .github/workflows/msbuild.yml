@@ -2,74 +2,103 @@ name: MSBuild
 
 on:
   push:
-    branches: [main]
+    branches: [ "main", "release/*" ]
   pull_request:
     branches: [ "main", "release/*" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: windows-latest
 
     env:
-      SOLUTION_FILE_PATH: .
       BUILD_CONFIGURATION: Release
+      BUILD_PLATFORM: x64
+      VCPKG_TRIPLET: x64-windows-static-md
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Only the C++ dependencies are needed; tools/True-Randomization is for the release pipeline.
       - name: Checkout subprojects submodules only
-        run: git submodule update --init subprojects
-      
+        run: git submodule update --init --depth 1 subprojects
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Mod/ClientVersion.h and Mod/StaticPakPin.h are generated from version.toml and
+      # release/static_pak_manifest.json; fail if the committed copies are stale.
+      - name: Check generated headers are up to date
+        shell: pwsh
+        run: |
+          python tools/release_info.py
+          git diff --exit-code -- Mod/ClientVersion.h Mod/StaticPakPin.h
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Generated headers are stale. Run 'python tools/release_info.py' and commit the result."
+          }
+
       - name: Restore vcpkg installed libraries
         id: vcpkg-cache
         uses: actions/cache@v4
         with:
           path: |
-            vcpkg_installed\x64-windows-static-md\lib
-            vcpkg_installed\x64-windows-static-md\include
-          key: vcpkg-installed-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-installed-${{ runner.os }}-
+            vcpkg_installed\${{ env.VCPKG_TRIPLET }}\lib
+            vcpkg_installed\${{ env.VCPKG_TRIPLET }}\include
+          key: vcpkg-installed-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
 
-      - name: Create vcpkg baseline
+      # vcpkg.json already pins builtin-baseline, so no baseline step is needed.
+      - name: Install dependencies via vcpkg
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        run: vcpkg x-update-baseline --add-initial-baseline
         shell: pwsh
-
-      - name: Install dependences via vcpkg
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        run: vcpkg install --triplet x64-windows-static-md
-        shell: pwsh
+        run: vcpkg install --triplet ${{ env.VCPKG_TRIPLET }}
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Set BSGamePath in project file
+      - name: Build BloodstainedAP (Release x64)
         shell: pwsh
-        run: |
-          $proj = "BloodstainedModdingSDK.vcxproj"
-          (Get-Content $proj) `
-            -replace '<BSGamePath>.*?</BSGamePath>', "<BSGamePath>${{ env.SOLUTION_FILE_PATH }}</BSGamePath>" |
-            Set-Content $proj
-
-      - name: Build solution (Release x64)
         run: >
           msbuild BloodstainedModdingSDK.vcxproj
           /p:Configuration=${{ env.BUILD_CONFIGURATION }}
-          /p:Platform=x64
+          /p:Platform=${{ env.BUILD_PLATFORM }}
           /m
+
+      # TrackerTests.vcxproj targets v145; override to the toolset the runner's VS ships with.
+      - name: Build TrackerTests
         shell: pwsh
+        run: >
+          msbuild tests\TrackerTests.vcxproj
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }}
+          /p:Platform=${{ env.BUILD_PLATFORM }}
+          /p:PlatformToolset=v143
+          /m
+
+      - name: Run TrackerTests
+        shell: pwsh
+        run: |
+          & "tests\${{ env.BUILD_PLATFORM }}\${{ env.BUILD_CONFIGURATION }}\TrackerTests.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('version.toml', 'rb'))['version'])"
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Upload build artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
-        if: github.ref == 'refs/heads/main'
         with:
-          name: BloodstainedAP-Release-x64
+          name: BloodstainedAP-${{ steps.version.outputs.version }}-${{ env.BUILD_CONFIGURATION }}-${{ env.BUILD_PLATFORM }}
           path: |
-            x64\Release\BloodstainedAP.asi
+            ${{ env.BUILD_PLATFORM }}\${{ env.BUILD_CONFIGURATION }}\BloodstainedAP.asi
+            ${{ env.BUILD_PLATFORM }}\${{ env.BUILD_CONFIGURATION }}\BloodstainedAP.pdb
           if-no-files-found: error
-      #       x64\Debug\*.dll
-      #       x64\Debug\*.pdb
-      #     if-no-files-found: error
-
