@@ -20,6 +20,10 @@ mono_crash.*
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
+!release/
+release/*
+!release/README.txt
+!release/static_pak_manifest.json
 [Rr]eleases/
 x64/
 x86/
@@ -364,3 +368,11 @@ FodyWeavers.xsd
 
 # VCPKG files
 vcpkg_installed
+
+# Tooling
+output
+ap-base
+*.pak
+tools/generation-target
+tools/repak
+tools/Engine

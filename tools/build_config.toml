@@ -1,0 +1,60 @@
+# Argument defaults for generate_base_pak.py, build_mod.py, build_ap_base.py,
+# build_static_pak.py and build_release.py.
+# Keys are the scripts' option names without the leading dashes; command-line
+# arguments override them. Relative paths resolve against this file's directory.
+# Top-level keys apply to every script that accepts the option.
+
+repak = '..\tools\repak\repak.exe'
+
+[base_pak]
+# Game install directory (the one containing BloodstainedRotN).
+game-root = 'C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night'
+# .NET install pythonnet loads; comment out to use the DOTNET_ROOT environment variable.
+dotnet-root = 'C:\Program Files\dotnet'
+
+[mod]
+game-dir = 'C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64'
+jobs = 16
+# The .vcxproj Release|x64 configuration says v143; build with v145 instead.
+toolset = 'v145'
+# clean = true
+
+[ap_base]
+# Standalone run of the deterministic AP base (build_static_pak.py runs it itself
+# with explicit arguments in TR source mode). output-dir must not exist yet.
+true-randomizer-dir = 'True-Randomization'
+game-pak = 'C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Content\Paks\pakchunk0-WindowsNoEditor.pak'
+output-dir = 'ap-base'
+report = 'ap-base.json'
+
+[static_pak]
+# Experimental AP-only build straight from TR source. The output path must not
+# exist yet unless force is set; a .base.json and .audit.json are written beside it.
+true-randomizer-dir = 'True-Randomization'
+# Generated from generate_base_pak.py
+baseline-pak = '.\output\TrueRandomizer-AP-Raw.pak'
+# Established mode instead: comment out the two keys above and set source-pak.
+# source-pak = '..\tools\Randomizer3082.pak'
+game-pak = 'C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Content\Paks\pakchunk0-WindowsNoEditor.pak'
+output = 'output\BloodstainedAP-candidate.pak'
+uasset-api-dir = 'True-Randomization\Tools\UAssetAPI'
+ue4-dds-tools-dir = 'True-Randomization\Tools\UE4DDSTools'
+# dotnet = 'dotnet'
+# keep-workdir = true
+# Replace an existing output and its .base.json/.audit.json instead of refusing.
+# force = true
+# Pass --pin on the command line (not here) once a candidate has been reviewed:
+# it records the pak in release/static_pak_manifest.json. See RELEASING.md.
+
+[release]
+pak = '.\output\BloodstainedAP-candidate.pak'
+asi = 'C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64\plugins\BloodstainedAP.asi'
+loader = 'C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64\winhttp.dll'
+archipelago-root = 'G:\programmingProjects\gameHacking\BloodstainedAP'
+world-source = 'G:\programmingProjects\gameHacking\BloodstainedAP\worlds\bloodstained_rotn'
+true-randomizer-license = 'True-Randomization\LICENSE'
+asi-loader-license = '.\LICENSE-Ultimate-ASI-Loader.txt'
+# A directory: the bundle is named BloodstainedAP-<version>[-<label>].zip from version.toml.
+output = 'releases'
+# archipelago-python = 'G:\programmingProjects\gameHacking\BloodstainedAP\.venv\Scripts\python.exe'
+# package-label = 'beta1'

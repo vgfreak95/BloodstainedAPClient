@@ -9,7 +9,9 @@ class Gui {
 
     bool Init();
     void Shutdown();
-    void Render();
+    void Render(IDXGISwapChain* swapChain);
+    void TryAutoConnect();
+    void ResetAutoConnect() { m_AutoConnectAttempted = false; }
 
     void ToggleMenu() { m_Open = !m_Open; }
     bool IsOpen() const { return m_Open; }
@@ -20,7 +22,6 @@ class Gui {
 
     ID3D11Device* GetDevice() const { return m_Device; }
     ID3D11DeviceContext* GetDeviceContext() const { return m_DeviceContext; }
-    ID3D11RenderTargetView* GetRenderTargetView() const { return m_RenderTargetView; }
     HWND GetGameWindow() const { return m_GameWindow; }
     WNDPROC GetOriginalWndProc() const { return m_OriginalWndProc; }
     void SetOriginalWndProc(WNDPROC proc) { m_OriginalWndProc = proc; }
@@ -36,12 +37,12 @@ class Gui {
 
     ID3D11Device* m_Device = nullptr;
     ID3D11DeviceContext* m_DeviceContext = nullptr;
-    ID3D11RenderTargetView* m_RenderTargetView = nullptr;
 
     bool m_Initialized = false;
     bool m_ImGuiInit = false;
     bool m_Open = false;
     bool m_IsResizing = false;
+    bool m_AutoConnectAttempted = false;
 
     WNDPROC m_OriginalWndProc = nullptr;
     HWND m_GameWindow = nullptr;

@@ -72,16 +72,18 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros">
-    <BSGamePath>C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
+    <BSGamePath>C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <BSGamePath>C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
-    <TargetName>version</TargetName>
+    <BSGamePath>C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
+    <TargetName>BloodstainedAP</TargetName>
+    <TargetExt>.asi</TargetExt>
     <ExternalIncludePath>CppSDK;CppSDK/SDK;subprojects;$(ExternalIncludePath)</ExternalIncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <BSGamePath>C:\SteamLibrary\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
-    <TargetName>version</TargetName>
+    <BSGamePath>C:\Program Files (x86)\Steam\steamapps\common\Bloodstained Ritual of the Night\BloodstainedRotN\Binaries\Win64</BSGamePath>
+    <TargetName>BloodstainedAP</TargetName>
+    <TargetExt>.asi</TargetExt>
     <ExternalIncludePath>CppSDK;CppSDK/SDK;subprojects;$(ExternalIncludePath)</ExternalIncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -120,19 +122,19 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>CppSDK/SDK;subprojects/json/include;subprojects/valijson/include;subprojects/wswrap/include;subprojects/websocketpp;subprojects/asio/asio/include;subprojects/asio/include;subprojects/apclientpp;.;CppSDK;extern;extern/libdetour;extern/imgui;extern/imgui/backends;extern/kiero;extern/minhook/include;extern/minhook/src;vcpkg_installed\x64-windows-static-md\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Zc:__cplusplus /bigobj /experimental:deterministic /pathmap:$(ProjectDir)= %(AdditionalOptions)</AdditionalOptions>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <ForceSynchronousPDBWrites>true</ForceSynchronousPDBWrites>
+      <DebugInformationFormat>None</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ModuleDefinitionFile>version\version.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>vcpkg_installed\x64-windows-static-md\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>vcpkg_installed\x64-windows-static-md\lib\libcrypto.lib;vcpkg_installed\x64-windows-static-md\lib\libssl.lib;vcpkg_installed\x64-windows-static-md\lib\zlib.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vcpkg_installed\x64-windows-static-md\lib\libcrypto.lib;vcpkg_installed\x64-windows-static-md\lib\libssl.lib;vcpkg_installed\x64-windows-static-md\lib\zs.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <PostBuildEvent>
-      <Command>xcopy /Y /F "$(TargetPath)" "$(BSGamePath)\"</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -144,26 +146,26 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>CppSDK/SDK;subprojects/json/include;subprojects/valijson/include;subprojects/wswrap/include;subprojects/websocketpp;subprojects/asio/asio/include;subprojects/asio/include;subprojects/apclientpp;.;CppSDK;extern;extern/libdetour;extern/imgui;extern/imgui/backends;extern/kiero;extern/minhook/include;extern/minhook/src;vcpkg_installed/x64-windows-static-md/include</AdditionalIncludeDirectories>
-      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/Zc:__cplusplus /bigobj /experimental:deterministic /pathmap:$(ProjectDir)= %(AdditionalOptions)</AdditionalOptions>
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
       <Optimization>MaxSpeed</Optimization>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <ForceSynchronousPDBWrites>true</ForceSynchronousPDBWrites>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ModuleDefinitionFile>version\version.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>vcpkg_installed\x64-windows-static-md\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>vcpkg_installed\x64-windows-static-md\lib\libcrypto.lib;vcpkg_installed\x64-windows-static-md\lib\libssl.lib;vcpkg_installed\x64-windows-static-md\lib\zlib.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>vcpkg_installed\x64-windows-static-md\lib\libcrypto.lib;vcpkg_installed\x64-windows-static-md\lib\libssl.lib;vcpkg_installed\x64-windows-static-md\lib\zs.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
-    <PostBuildEvent>
-      <Command>xcopy /Y /F "$(TargetPath)" "$(BSGamePath)\"</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CppSDK\SDK\Basic.cpp" />
     <ClCompile Include="CppSDK\SDK\CoreUObject_functions.cpp" />
     <ClCompile Include="CppSDK\SDK\Engine_functions.cpp" />
     <ClCompile Include="CppSDK\SDK\ProjectBlood_functions.cpp" />
+    <ClCompile Include="CppSDK\SDK\UMG_functions.cpp" />
     <ClCompile Include="extern\imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="extern\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="extern\imgui\imgui.cpp" />
@@ -183,13 +185,19 @@
     </ClCompile>
     <ClCompile Include="Mod\Archipelago.cpp" />
     <ClCompile Include="Mod\APBridge.cpp" />
+    <ClCompile Include="Mod\EnemyDropShuffle.cpp" />
     <ClCompile Include="Mod\GameManager.cpp" />
     <ClCompile Include="Mod\Gui.cpp" />
     <ClCompile Include="Mod\HookManager.cpp" />
+    <ClCompile Include="Mod\InGameTracker.cpp" />
     <ClCompile Include="Mod\IToggleMod.cpp" />
     <ClCompile Include="Mod\Logger.cpp" />
+    <ClCompile Include="Mod\MainMenuStatus.cpp" />
     <ClCompile Include="Mod\ModRunner.cpp" />
+    <ClCompile Include="Mod\QualityOfLife.cpp" />
     <ClCompile Include="Mod\ToggleMods.cpp" />
+    <ClCompile Include="Mod\Tracker.cpp" />
+    <ClCompile Include="Mod\TrackerRuleEvaluator.cpp" />
     <ClCompile Include="Mod\Utils.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -223,9 +231,23 @@
     <ClInclude Include="Mod\HookManager.h" />
     <ClInclude Include="Mod\IToggleMod.h" />
     <ClInclude Include="Mod\Logger.h" />
+    <ClInclude Include="Mod\ClientVersion.h" />
+    <ClInclude Include="Mod\StaticPakPin.h" />
+    <ClInclude Include="Mod\ConnectionUri.h" />
+    <ClInclude Include="Mod\EnemyDropData.generated.h" />
+    <ClInclude Include="Mod\EnemyDropShuffle.h" />
+    <ClInclude Include="Mod\EnemyDropShuffleLogic.h" />
+    <ClInclude Include="Mod\MainMenuStatus.h" />
     <ClInclude Include="Mod\ModRunner.h" />
     <ClInclude Include="Mod\NotifyObject.h" />
+    <ClInclude Include="Mod\QualityOfLife.h" />
+    <ClInclude Include="Mod\QualityOfLifeLogic.h" />
     <ClInclude Include="Mod\ToggleMods.h" />
+    <ClInclude Include="Mod\Tracker.h" />
+    <ClInclude Include="Mod\InGameTracker.h" />
+    <ClInclude Include="Mod\TrackerData.generated.h" />
+    <ClInclude Include="Mod\TrackerRuleEvaluator.h" />
+    <ClInclude Include="Mod\TrackerRules.generated.h" />
     <ClInclude Include="Mod\Utils.h" />
     <ClInclude Include="version\version.h" />
   </ItemGroup>

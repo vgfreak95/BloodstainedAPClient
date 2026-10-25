@@ -1,0 +1,4 @@
+# Python 3.13, .NET 8. No GUI/Steam integration dependencies are needed.
+pythonnet==3.0.5
+pyuepak==0.2.8
+cryptography==50.0.2

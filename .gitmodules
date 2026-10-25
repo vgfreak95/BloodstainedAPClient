@@ -16,3 +16,6 @@
 [submodule "subprojects/asio"]
 	path = subprojects/asio
 	url = https://github.com/chriskohlhoff/asio.git
+[submodule "tools/True-Randomization"]
+	path = tools/True-Randomization
+	url = https://github.com/Lakifume/True-Randomization.git

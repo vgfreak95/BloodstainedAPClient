@@ -13,6 +13,8 @@
 
 #include <ProjectBlood_structs.hpp>
 #include <UnrealContainers.hpp>
+#include <functional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -20,6 +22,9 @@
 #include "Engine_classes.hpp"
 #include "PB_Chr_Root_classes.hpp"
 #include "ProjectBlood_classes.hpp"
+
+enum class ItemGrantResult { Granted, AtCapacity, Unsupported, Rejected };
+enum class DlcOwnership { NotApplicable, Owned, NotOwned, NotReady };
 
 class GameManager {
    public:
@@ -36,15 +41,26 @@ class GameManager {
     // Instances
     SDK::UWorld* World() const { return SDK::UWorld::GetWorld(); };
     SDK::UEngine* Engine() const { return SDK::UEngine::GetEngine(); };
+    // Startup polling runs on the plugin worker thread. Do not use
+    // UGameplayStatics::GetGameInstance here: the generated SDK wrapper invokes
+    // UObject::ProcessEvent, which is unsafe while the engine and hook chain are
+    // still being initialized. UWorld owns the same pointer directly.
     SDK::UGameInstance* GameInstance() const {
-        return SDK::UGameplayStatics::GetGameInstance(GameManager::Instance().World());
+        auto* world = GameManager::Instance().World();
+        return world ? world->OwningGameInstance : nullptr;
     };
     SDK::APBPlayerController* PlayerController() const {
-        return (SDK::APBPlayerController*)(GameManager::Instance().GameInstance()->LocalPlayers[0]->PlayerController);
+        auto* gameInstance = GameManager::Instance().GameInstance();
+        if (!gameInstance || gameInstance->LocalPlayers.Num() <= 0 || !gameInstance->LocalPlayers[0]) return nullptr;
+        return static_cast<SDK::APBPlayerController*>(gameInstance->LocalPlayers[0]->PlayerController);
     };
-    SDK::APB_Chr_Root_C* Player() const { return (SDK::APB_Chr_Root_C*)PlayerController()->Pawn; };
+    SDK::APB_Chr_Root_C* Player() const {
+        auto* playerController = PlayerController();
+        return playerController ? static_cast<SDK::APB_Chr_Root_C*>(playerController->Pawn) : nullptr;
+    };
     SDK::UPBRoomManager* RoomManager() const {
-        return ((SDK::UPBGameInstance*)(GameManager::Instance().GameInstance()))->GetRoomManager();
+        auto* gameInstance = static_cast<SDK::UPBGameInstance*>(GameManager::Instance().GameInstance());
+        return gameInstance ? gameInstance->pRoomManager : nullptr;
     };
 
     bool Init();
@@ -52,14 +68,26 @@ class GameManager {
     bool IsInitialized();
     bool IsInstanceValid(SDK::UObject* object, const char* str);
     bool PopulateDisplayToItemIdTable();
+    bool CanReceiveItems();
+    DlcOwnership GetDlcOwnership(std::string_view dlcKey) const;
+    DlcOwnership GetPaidDlcItemOwnership(std::string_view nativeItemId) const;
+    bool IsPaidDlcShard(std::string_view nativeItemId) const;
+    bool IsRandomizedDlcItem(SDK::FName nativeItemId) const;
+    bool PrimeOwnedPaidDlcCatalogRows();
+    void SuppressRandomizedDlcCatalogRowsForNewGame();
+    void RestoreRandomizedDlcCatalogRowsAfterNewGameInit();
 
-    void GivePlayerItem(const std::string& name, bool shouldDisplay = true, int count = 1);
+    void GivePlayerItem(const std::string& name, bool shouldDisplay = true, int count = 1,
+                        std::function<void(ItemGrantResult)> completion = {});
     void GivePlayerCoin(SDK::int32 amount, bool shouldDisplay = true);
     void GivePlayerMaxStatItem(std::string& maxStat, bool shouldDisplay = true);
     void GivePlayerStatusMultiplier(SDK::EPBEquipSpecialAttribute attribute, float multiplier);
     std::optional<SDK::FPBItemCatalogData> PlayerHasItem(const SDK::TArray<SDK::FPBItemCatalogData>& itemsArray,
                                                          const std::string& itemName);
     std::optional<SDK::FPBItemCatalogData> CheckAllInventories(const std::string& itemName);
+    bool UnlockEquipmentInShop(const std::string& itemName);
+    void ApplyWaystoneSafety();
+    bool TryUseWaystone();
 
     bool CanKillPlayer();
     void KillPlayer();
@@ -104,6 +132,9 @@ class GameManager {
     bool initCompleted;
     bool postInitCompleted;
     bool isPlayerDead = false;
+    bool paidDlcCatalogPrimed_ = false;
+    bool paidDlcCatalogPendingLogged_ = false;
+    bool suppressRandomizedDlcCatalogForNewGame_ = false;
 
     // m17RVA_008
     const std::unordered_set<std::string> bossRooms = {"m01SIP_000", "m01SIP_022", "m09TRN_002",

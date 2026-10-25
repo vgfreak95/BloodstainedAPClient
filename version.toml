@@ -1,0 +1,5 @@
+# Single source of truth for the Bloodstained AP release version.
+# tools2/release_info.py regenerates Mod/ClientVersion.h from this file, and
+# tools2/build_release.py names and validates the bundle with it. See tools2/RELEASING.md.
+version = "1.1.1"
+min_archipelago_version = "0.6.7"
