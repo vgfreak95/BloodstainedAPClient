@@ -42,7 +42,7 @@ server log when reporting connection or missing-check problems.
 - Windows 10 / 11
 
 ### Building:
-1. Clone/Download the `main` branch of the repository with command `git clone --recurse-submodules=subprojects`. `main` will always be stable latest functional code.
+1. Clone/Download the `main` branch of the repository with command `git clone <repo_name.git> --recursive`. The `main` will always be stable latest functional code.
 2. Open a VS Administrator Terminal, and `cd` into the project root directory/folder.
 3. Run `vcpkg install --triplet x64-windows-static-md` to install openssl and zlib. The packages are defined in `vcpkg.json` in project root directory/folder.
 4. Open the `BloodstainedAPClient.vcxproj` and modify the `<BSGamePath>` sections to match your Games target destination.

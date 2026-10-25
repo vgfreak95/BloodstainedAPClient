@@ -370,7 +370,6 @@ FodyWeavers.xsd
 vcpkg_installed
 
 # Tooling
-True-Randomization
 output
 ap-base
 *.pak
